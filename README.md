@@ -6,6 +6,8 @@ A modular automation stack for [Bitburner](https://bitburner-official.github.io/
 ![License](https://img.shields.io/badge/License-MIT-blue)
 ![Bitburner](https://img.shields.io/badge/Bitburner-3.0%2B-green)
 
+> 👋 Built by a disabled veteran in the gaps between appointments. If `scb` saves you time, a ⭐ on the repo is free and is the single most useful thing you can do. A [coffee or pizza](https://buymeacoffee.com/jcinc) keeps the commits coming. The AI player remains unimpressed by your generosity — I am not.
+
 ![SCB Bitburner architecture: editor → filesync → game, with scb-watch on the host writing /Temp markers, and the in-game scb / watchdog / ollama-player / approve-patch layer talking to Ollama](docs/architecture.png)
 
 ---
@@ -485,13 +487,17 @@ The AI player itself runs without SF-2/6/10 — it just won't propose those gate
 
 ---
 
-## Support
+## ☕ Support
 
-If this saved you some hours or sparked an idea you ran with:
+I'm a disabled veteran who ships open-source projects in the gaps between appointments. If `scb` saved you some hours, sparked an idea you ran with, or just made you laugh once while tailing the logs —
+
+* ⭐ **Star the repo.** Free, one click, genuinely the single most useful thing you can do. More stars = more Bitburner players find it.
+* ☕ **[Buy me a coffee](https://buymeacoffee.com/jcinc)** — one-off, or a recurring membership if you really want to kit me out. Memberships fund the un-shippable work: safety audits, refactors, more model backends, more guard rails.
+* 🍕 Buy enough coffees and I will absolutely upgrade one to a pizza. My dog will help eat it.
+
+None of this is expected. The AI player keeps running either way. If you got genuine value out of this repo, a few seconds (the star) or a few bucks (the coffee) goes a long way. Either way — thanks for being here.
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-jcinc-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/jcinc)
-
-One‑off coffees and recurring **memberships** are both live on the page — memberships fund the ongoing work (new actions, more guard rails, additional model backends). Either is appreciated and neither is expected.
 
 ---
 
