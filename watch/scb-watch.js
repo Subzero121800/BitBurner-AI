@@ -333,7 +333,25 @@ function probeBridge() {
   });
 }
 
+// macOS notification helper. Best-effort; quietly no-ops on non-Darwin.
+let lastNotifyAt = 0;
+function notifyMac(title, message) {
+  if (process.platform !== "darwin") return;
+  // Throttle: at most one notification every 5 minutes per kind so
+  // we don't spam Notification Center while the WS is flapping.
+  if (Date.now() - lastNotifyAt < 5 * 60 * 1000) return;
+  lastNotifyAt = Date.now();
+  try {
+    const escTitle = String(title).replace(/"/g, '\\"');
+    const escMsg   = String(message).replace(/"/g, '\\"');
+    spawn("osascript", [
+      "-e", `display notification "${escMsg}" with title "${escTitle}" sound name "Funk"`
+    ], { stdio: "ignore", detached: true }).unref();
+  } catch (_) {}
+}
+
 let lastStatus = "";
+let disconnectedSince = 0;
 setInterval(async () => {
   const sync   = syncConnectionState();
   const bridge = await probeBridge();
@@ -342,6 +360,23 @@ setInterval(async () => {
   if (line !== lastStatus) {
     logLine(line);
     lastStatus = line;
+  }
+
+  // Track sustained disconnect and fire a macOS notification when
+  // it crosses 60 s — the user wanted a permanent fix, this is the
+  // host-side half of it. (In-game half is the watchdog DOM walker
+  // and the AI's reconnect_remote_api action.)
+  if (sync === "disconnected" || sync === "no-events") {
+    if (disconnectedSince === 0) disconnectedSince = Date.now();
+    if (Date.now() - disconnectedSince > 60_000) {
+      notifyMac(
+        "BitBurner-AI: Remote API offline",
+        "filesync hasn't seen game traffic in 60s+. Open Bitburner → Options → Remote API → Connect (and tick Auto-connect on Start)."
+      );
+    }
+  } else {
+    if (disconnectedSince > 0) logLine("filesync recovered after " + Math.round((Date.now() - disconnectedSince) / 1000) + "s");
+    disconnectedSince = 0;
   }
 }, STATUS_MS);
 

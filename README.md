@@ -115,7 +115,15 @@ The Claude bridge is **opt-in** — `start` doesn't launch it. If you want Claud
 
 ### 3. Connect the game
 
-In Bitburner: *Options → Remote API → Connect*. The status flips to **Online** and `.run/sync.log` shows `Connection made!`. Optional but recommended: enable *Auto-connect on Start* in the same panel.
+In Bitburner: *Options → Remote API → Connect*. The status flips to **Online** and `.run/sync.log` shows `Connection made!`.
+
+**Strongly recommended**: tick *Auto-connect on Start* in the same panel. Once on, the WS reconnects on every game reload — the single most reliable way to avoid stale-code-running-in-the-game problems. The system has three layers of defence against missed reconnects:
+
+1. **Auto-connect on Start** (game-side, persistent across reloads — set this once)
+2. **In-game watchdog** auto-reconnect: `/scb-watchdog.js` detects a stale heartbeat and runs an aggressive DOM walker that opens *Options → Remote API → Connect* programmatically
+3. **macOS desktop notification** from `scb-watch` if filesync goes 60s+ without seeing game traffic — so you know to intervene if all else fails
+
+The AI player also gets a `state.systemHealth.syncStale` signal and is instructed to emit a single `reconnect_remote_api` action when the host can't deliver code anymore.
 
 ### 4. Run the orchestrator
 

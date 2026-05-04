@@ -148,6 +148,12 @@ function buildGameState(ns, safety) {
       unlocked: money >= (Number(safety.minCashReserve || 0) + Number(safety.savingsTarget || 0))
     },
 
+    // System health — surfaces sync staleness so the AI can decide
+    // to call reconnect_remote_api when the host can no longer
+    // deliver fresh code. Heartbeat is written by scb-watch every 2s
+    // and stops updating when the WS to the game drops.
+    systemHealth: getSystemHealth(ns),
+
     serverFleet: {
       ownedCount: purchased.length,
       limit: serverLimit,
@@ -291,6 +297,11 @@ function buildPrompt(state, safety) {
     "- state.savings.threshold = minCashReserve + savingsTarget. While state.savings.unlocked == false, all discretionary spending is blocked server-side: buy_program, buy_server, upgrade_server, buy_augmentation, donate_faction will all be rejected with SAVINGS-LOCKED.",
     "- When state.savings.unlocked == false, focus exclusively on income generation: deploy_hack against the highest-value targets in state.targets, commit_crime, work_company, work_faction, study, gym, hacknet purchases/upgrades, or noop/wait if RAM is full.",
     "- When state.savings.unlocked == true, spending is allowed up to safety.cashSpendCapPct of starting-cycle cash; prefer upgrades + augs that compound future income.",
+    "",
+    "System health (HIGHEST PRIORITY — read this BEFORE picking actions):",
+    "- state.systemHealth.syncStale: when true the host can no longer deliver fresh code into the game (the heartbeat file has gone stale). The state you're seeing may be hours old.",
+    "- When syncStale is true, your ENTIRE response must be exactly: [{\"action\":\"reconnect_remote_api\"}] — nothing else. Don't deploy, don't buy, don't propose patches. The reconnect action calls the in-game DOM to click Options→Remote API→Connect. After it succeeds, normal cycles resume.",
+    "- When syncStale is false, ignore reconnect_remote_api entirely.",
     "",
     "Filesystem rules:",
     "- write_generated_script and delete_generated_script only work under /ai/generated/, /ai/scratch/, /Temp/, /logs/. Anywhere else is rejected.",
@@ -741,6 +752,31 @@ function resolveOllamaHost(ns, fallback) {
   } catch (_) {
     return fallback;
   }
+}
+
+function getSystemHealth(ns) {
+  // /Temp/scb-heartbeat.txt is rewritten by scb-watch every 2 s and
+  // delivered into the game by filesync over the active WS. If the
+  // WS dies, the file goes stale — staleness is the only reliable
+  // signal we have inside the game that fresh code can no longer
+  // reach us.
+  let heartbeatAgeMs = Infinity;
+  try {
+    if (ns.fileExists("/Temp/scb-heartbeat.txt", "home")) {
+      const beat = Number(String(ns.read("/Temp/scb-heartbeat.txt") || "").trim());
+      if (beat) heartbeatAgeMs = Date.now() - beat;
+    }
+  } catch (_) {}
+  // 15 s threshold matches the watchdog's STALE_MS so both layers
+  // agree on the verdict.
+  const syncStale = !isFinite(heartbeatAgeMs) || heartbeatAgeMs > 15_000;
+  return {
+    syncStale,
+    heartbeatAgeSec: isFinite(heartbeatAgeMs) ? Math.round(heartbeatAgeMs / 1000) : null,
+    advice: syncStale
+      ? "Remote API appears disconnected. Emit a single reconnect_remote_api action this cycle. Skip business actions until sync recovers — deploys won't survive the next code update anyway."
+      : "Remote API healthy. Proceed with normal action selection."
+  };
 }
 
 function freeRam(ns, server) {

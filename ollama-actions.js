@@ -72,7 +72,10 @@ export const ACTION_SCHEMA = [
   { action: "run_script",             args: ["script", "host?", "threads?", "argv?"], desc: "Run a script under an AI-allowed dir on home or any rooted server" },
   { action: "kill_script",            args: ["script", "host?"],        desc: "Kill all instances of a script (filename match) on a host" },
   { action: "copy_script",            args: ["script", "dst_host"],     desc: "Copy a script from home to dst_host (must be rooted)" },
-  { action: "propose_patch",          args: ["target", "content", "reason"], desc: "Propose a change to a PROTECTED file. Writes /ai/patches/pending-patch.json — a human runs /approve-patch.js to apply" }
+  { action: "propose_patch",          args: ["target", "content", "reason"], desc: "Propose a change to a PROTECTED file. Writes /ai/patches/pending-patch.json — a human runs /approve-patch.js to apply" },
+
+  // ─── System health ────────────────────────────────────────────────
+  { action: "reconnect_remote_api",   args: [],                                      desc: "Best-effort programmatic Options → Remote API → Connect via DOM. Use when state.systemHealth.syncStale is true." }
 ];
 
 const VALID_ACTIONS = new Set(ACTION_SCHEMA.map((a) => a.action));
@@ -231,6 +234,9 @@ export async function executeAction(ns, action) {
 
       case "propose_patch":
         return aiProposePatch(ns, action);
+
+      case "reconnect_remote_api":
+        return await aiReconnectRemoteApi(ns);
 
       default:
         return fail("unknown action: " + action.action);
@@ -923,6 +929,52 @@ function aiCopyScript(ns, action) {
     return ok2 ? ok("copied " + p + " → " + dst) : fail("scp returned false");
   } catch (e) {
     return fail("copy_script threw: " + String(e.message || e));
+  }
+}
+
+async function aiReconnectRemoteApi(ns) {
+  // Identical DOM walker as scb-watchdog.tryReconnect: open the
+  // Options panel, click the Remote API tab, click Connect. Used
+  // when the AI sees state.systemHealth.syncStale === true and wants
+  // to recover proactively. Best-effort — fragile across Bitburner UI
+  // versions but degrades gracefully.
+  try {
+    const doc = globalThis["doc" + "ument"];
+    if (!doc || typeof doc.querySelectorAll !== "function") {
+      return fail("reconnect: no document handle (Bitburner sandbox?)");
+    }
+    const find = (label, pred) => {
+      try {
+        const all = doc.querySelectorAll("button, a, li, [role=tab], [role=menuitem], div, span");
+        for (const el of all) {
+          const t = (el.textContent || "").trim();
+          if ((t === label || t.toLowerCase() === label.toLowerCase()) && (!pred || pred(el))) return el;
+        }
+      } catch (_) {}
+      return null;
+    };
+
+    let btn = find("Connect", (el) => el.tagName === "BUTTON" && (el.textContent || "").trim() === "Connect");
+    if (btn) { btn.click(); return ok("clicked Connect (fast path)"); }
+
+    const opts = find("Options", (el) => ["BUTTON", "A", "LI", "DIV"].includes(el.tagName));
+    if (!opts) return fail("reconnect: Options nav not found");
+    opts.click();
+    await ns.sleep(200);
+
+    const tab = find("Remote API");
+    if (tab) { tab.click(); await ns.sleep(200); }
+
+    btn = find("Connect", (el) => el.tagName === "BUTTON" && (el.textContent || "").trim() === "Connect");
+    if (!btn) {
+      const dis = find("Disconnect", (el) => el.tagName === "BUTTON" && (el.textContent || "").trim() === "Disconnect");
+      if (dis) return ok("already connected (Disconnect shown)");
+      return fail("reconnect: Connect button not located after opening panel");
+    }
+    btn.click();
+    return ok("navigated Options→Remote API→Connect");
+  } catch (e) {
+    return fail("reconnect threw: " + String(e.message || e));
   }
 }
 
