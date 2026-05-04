@@ -6,7 +6,7 @@ A modular automation stack for [Bitburner](https://bitburner-official.github.io/
 ![License](https://img.shields.io/badge/License-MIT-blue)
 ![Bitburner](https://img.shields.io/badge/Bitburner-3.0%2B-green)
 
-![SCB Bitburner architecture: editor → filesync → game, with scb-watch on the host writing /Temp markers, and the in-game scb / watchdog / ollama-player / approve-patch layer talking to Ollama](docs/architecture.svg)
+![SCB Bitburner architecture: editor → filesync → game, with scb-watch on the host writing /Temp markers, and the in-game scb / watchdog / ollama-player / approve-patch layer talking to Ollama](docs/architecture.png)
 
 ---
 
