@@ -718,8 +718,10 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 }
 
 // ─── persistent action log ──────────────────────────────────────────
-const PLAYER_LOG = "/logs/ollama-player.log";
-const PLAYER_LOG_PREV = "/logs/ollama-player.log.1";
+// .txt extension (not .log) so Bitburner's terminal `download` works
+// — only .js/.script/.txt files can be downloaded from in-game.
+const PLAYER_LOG = "/logs/ollama-player.txt";
+const PLAYER_LOG_PREV = "/logs/ollama-player.1.txt";
 const PLAYER_LOG_MAX_BYTES = 256_000;
 
 function appendLog(ns, safety, line) {

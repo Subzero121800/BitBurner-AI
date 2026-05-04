@@ -1,6 +1,6 @@
 /** @param {NS} ns */
 export async function main(ns) {
-  // WATCHDOG_VERSION_3
+  // WATCHDOG_VERSION_4
   ns.disableLog("ALL");
   try { ns.ui?.openTail?.(); } catch (_) {}
 
@@ -18,8 +18,8 @@ export async function main(ns) {
   const FLUSH_EVERY    = 15;
   const SINK_BASE      = "http://127.0.0.1:9999/sink/";
   const LOG_TARGETS    = [
-    { file: "/logs/scb.log",           name: "scb" },
-    { file: "/logs/ollama-player.log", name: "ollama-player" },
+    { file: "/logs/scb.txt",           name: "scb" },
+    { file: "/logs/ollama-player.txt", name: "ollama-player" },
   ];
 
   let lastMarker = readFileSafe(RESTART_FILE);
@@ -87,35 +87,47 @@ export async function main(ns) {
     await ns.sleep(POLL_MS);
   }
 
+  // Cursor-based flush: send only the new bytes past the last
+  // pushed offset, leave the in-game log intact. The player's
+  // OBSERVE step reads /logs/ollama-player.log to populate
+  // state.recentActions / state.jammedActions — truncating the
+  // log here would empty that buffer between cycles and defeat
+  // repeat-suppression. Cursor is per-log file in /Temp/.
+  // The player's writer rotates at 256 KB (file → file.1 + reset),
+  // so the cursor can validly exceed the file size — that means a
+  // rotation happened and we should resume from offset 0.
   async function flushLog(gameFile, name) {
     try {
       if (!ns.fileExists(gameFile, "home")) return;
       const content = ns.read(gameFile);
       if (!content) return;
+
+      const cursorFile = "/Temp/log-cursor-" + name + ".txt";
+      let offset = 0;
+      if (ns.fileExists(cursorFile, "home")) {
+        offset = parseInt(String(ns.read(cursorFile)).trim(), 10) || 0;
+      }
+      if (offset > content.length) offset = 0; // file rotated
+      if (offset >= content.length) return;     // nothing new
+
+      const chunk = content.slice(offset);
       const url = SINK_BASE + name;
       const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
       const tid  = ctrl ? setTimeout(() => ctrl.abort(), 3000) : null;
+
       try {
         const res = await fetch(url, {
           method:  "POST",
           headers: { "Content-Type": "text/plain" },
-          body:    content,
+          body:    chunk,
           signal:  ctrl ? ctrl.signal : undefined,
         });
         if (tid) clearTimeout(tid);
-        if (!res || !res.ok) return; // sink down — try again next cycle
-        // Single-threaded JS: between read and write nothing else can
-        // touch the file. Re-read in case the writer appended during
-        // the await — preserve any new content.
-        const fresh = ns.read(gameFile);
-        if (fresh.length > content.length) {
-          ns.write(gameFile, fresh.slice(content.length), "w");
-        } else {
-          ns.write(gameFile, "", "w");
-        }
+        if (!res || !res.ok) return; // sink down — retry next flush
+        ns.write(cursorFile, String(content.length), "w");
       } catch (_) {
         if (tid) clearTimeout(tid);
-        // network error — leave file alone, retry next flush
+        // network error — leave cursor alone, retry next flush
       }
     } catch (e) {
       ns.print("WARN  flushLog(" + name + ") threw: " + String(e.message || e));

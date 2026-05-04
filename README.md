@@ -161,23 +161,25 @@ Configured in `SAFETY` in [`scb.js`](scb.js):
 
 The orchestrator and player both append a structured line to disk for every cycle / action:
 
-| In-game file              | Source                  | Contents                                                          |
-|---------------------------|-------------------------|-------------------------------------------------------------------|
-| `/logs/scb.log`           | `scb.js`                | `CYCLE hack=… crackers=… rooted=… backdoor=… deployed=… skipped=…` |
-| `/logs/ollama-player.log` | `ollama-player.js`      | `OK`/`SKIP`/`FAIL` per action with the JSON proposal + result     |
+| In-game file              | Source              | Contents                                                          |
+|---------------------------|---------------------|-------------------------------------------------------------------|
+| `/logs/scb.txt`           | `scb.js`            | `CYCLE hack=… crackers=… rooted=… backdoor=… deployed=… skipped=…` |
+| `/logs/ollama-player.txt` | `ollama-player.js`  | `OK`/`SKIP`/`FAIL` per action with the JSON proposal + result     |
 
-Both rotate at ~256 KB to keep `ns.read` cheap. Every 30 s the in-game watchdog POSTs new content to the local sink (`http://127.0.0.1:9999/sink/<name>`) and truncates the in-game file on success — so you also get tail‑able copies on the host:
+(`.txt` rather than `.log` so the in-game `download <file>` command accepts them — Bitburner's terminal restricts downloads to `.js`/`.script`/`.txt`.)
+
+Both rotate at ~256 KB to keep `ns.read` cheap. Every 30 s the in-game watchdog POSTs *only the new bytes past the last sent offset* to the local sink (`http://127.0.0.1:9999/sink/<name>`). The in-game file is **not** truncated — the player's OBSERVE step still needs to read it to populate `state.recentActions` / `state.jammedActions` for self-correction.
 
 ```sh
-tail -f .run/game-scb.log              # orchestrator cycle history
-tail -f .run/game-ollama-player.log    # AI action stream
+tail -f .run/game-scb.log              # orchestrator cycle history (host-side)
+tail -f .run/game-ollama-player.log    # AI action stream (host-side)
 ```
 
-Ad-hoc pulls of any in-game file still work via the terminal: `download /logs/scb.log`.
+Ad-hoc pulls work via the in-game terminal: `download /logs/scb.txt`.
 
 ### Self-context (player feeds its own log into the prompt)
 
-`buildGameState` reads the last 30 lines of `/logs/ollama-player.log` and includes them as `state.recentActions`. It also pre-computes `state.jammedActions` — `(action, reason)` pairs that have failed 3+ times in a row — and the system prompt explicitly tells the model to abandon those. The `safetyCheck` validator enforces it server-side too: if a proposed action matches a jammed signature it gets rejected with `REPEAT-SUPPRESSED (Nx): identical action just failed — try a different approach`.
+`buildGameState` reads the last 30 lines of `/logs/ollama-player.txt` and includes them as `state.recentActions`. It also pre-computes `state.jammedActions` — `(action, reason)` pairs that have failed 3+ times in a row — and the system prompt explicitly tells the model to abandon those. The `safetyCheck` validator enforces it server-side too: if a proposed action matches a jammed signature it gets rejected with `REPEAT-SUPPRESSED (Nx): identical action just failed — try a different approach`.
 
 The model can also call `read_file` on its own log mid-cycle to look further back, and emit `propose_patch` if it spots a code-level bug in the orchestrator or action library — the human-in-loop reviewer (`approve-patch.js`) gates those.
 

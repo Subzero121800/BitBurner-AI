@@ -245,8 +245,9 @@ export async function main(ns) {
 }
 
 // ─── persistent cycle log ──────────────────────────────────────────
-const SCB_LOG = "/logs/scb.log";
-const SCB_LOG_PREV = "/logs/scb.log.1";
+// .txt extension (not .log) so Bitburner's terminal `download` works.
+const SCB_LOG = "/logs/scb.txt";
+const SCB_LOG_PREV = "/logs/scb.1.txt";
 const SCB_LOG_MAX_BYTES = 256_000;
 
 function appendScbLog(ns, line) {
