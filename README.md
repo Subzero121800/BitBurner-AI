@@ -266,6 +266,16 @@ run /ollama-actions.js --list      # dump the action schema
 
 ---
 
+## Support
+
+If this saved you some hours or sparked an idea you ran with:
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-jcinc-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/jcinc)
+
+One‑off coffees and recurring **memberships** are both live on the page — memberships fund the ongoing work (new actions, more guard rails, additional model backends, etc.). Either one is appreciated and neither is expected.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
