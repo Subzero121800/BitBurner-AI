@@ -142,18 +142,33 @@ From here, save any of `scb.js` / `ollama-player.js` / `ollama-actions.js` in yo
 2. **Decide** — POST the state + system prompt to whichever Ollama endpoint scb-watch flagged as reachable. Falls through to `ns.wget` if `fetch` is blocked.
 3. **Execute** — run up to `safety.maxActionsPerCycle` actions in order, gating each on per-action validators and the global safety policy.
 
-### Safety policy
+### Safety / economy policy
 
-Configured in `SAFETY` in [`scb.js`](scb.js):
+Configured in `SAFETY` in [`scb.js`](scb.js). All settings are passed to `ollama-player.js` as a JSON arg every launch and re-published to `/Temp/economy.json` every cycle so other in-game scripts (the server upgrader, future helpers) honour the same numbers without their own hardcoded copies.
 
-| Setting                  | Default     | Effect                                                                      |
-|--------------------------|-------------|-----------------------------------------------------------------------------|
-| `maxActionsPerCycle`     | 5           | Hard cap on actions per OBSERVE cycle.                                      |
-| `minCashReserve`         | $1M         | Player skips spending actions that would drop home cash below this.         |
-| `cashSpendCapPct`        | 90          | Per-cycle spend cap, expressed as a % of starting cash.                     |
-| `minAugsToInstall`       | 5           | `install_augmentations` is rejected if fewer than this many are queued.     |
-| `requireConfirmForReset` | true        | Blocks `install_augmentations` / `soft_reset` unless `/Temp/ai-confirm-reset.txt` exists. |
-| `blockedActions`         | `["soft_reset"]` | Hard deny list — outright rejected before validation.                  |
+| Setting                  | Default     | Effect                                                                                                                                          |
+|--------------------------|-------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| `maxActionsPerCycle`     | 5           | Hard cap on actions per OBSERVE cycle.                                                                                                          |
+| `minCashReserve`         | $1M         | **Hard floor.** Any action that would drop liquid home cash below this is rejected.                                                              |
+| `savingsTarget`          | $100M       | **Soft target.** While liquid cash < (`minCashReserve` + `savingsTarget`), discretionary spending is paused server-side and the upgrader sleeps. |
+| `cashSpendCapPct`        | 90          | Once savings unlocked, per-cycle spend ceiling as a % of starting-cycle cash.                                                                   |
+| `minAugsToInstall`       | 5           | `install_augmentations` is rejected if fewer than this many are queued.                                                                          |
+| `requireConfirmForReset` | true        | Blocks `install_augmentations` / `soft_reset` unless `/Temp/ai-confirm-reset.txt` exists.                                                        |
+| `blockedActions`         | `["soft_reset"]` | Hard deny list — outright rejected before validation.                                                                                       |
+| `logAllActions`          | true        | Gates `/logs/ollama-player.txt` writes.                                                                                                          |
+
+**How savings works**: discretionary actions (`buy_program`, `buy_server`, `upgrade_server`, `buy_augmentation`, `donate_faction`) are rejected with `SAVINGS-LOCKED: cash is $X short of savings target ($Y)` whenever the threshold isn't met. Income-generating actions (`deploy_hack`, `commit_crime`, `work_company`, `study`, `gym`, hacknet) still run. Once cash crosses the threshold the lock dissolves until a big spend drains the buffer — then it re-locks. The system prompt tells the AI about this so it focuses on income while locked.
+
+### AI tuning
+
+`AI_CONFIG` in [`scb.js`](scb.js) carries model-tuning knobs alongside connectivity:
+
+| Setting          | Default     | Effect                                                                                            |
+|------------------|-------------|---------------------------------------------------------------------------------------------------|
+| `temperature`    | 0.2         | Ollama sampling temperature. 0 = deterministic, 0.7 = creative. Low is better for actuators.      |
+| `numCtx`         | 8192        | Ollama context window. Increase if `state.recentActions` starts getting truncated by your model.  |
+| `recentLogLines` | 30          | How many lines of `/logs/ollama-player.txt` are fed back into the prompt as `state.recentActions`. |
+| `jamThreshold`   | 3           | Identical `(action, reason)` failures in the recent window before the action is auto-rejected.    |
 
 **Kill switch**: write any content to `/Temp/ollama-player-stop.txt` — the player exits cleanly on its next cycle.
 

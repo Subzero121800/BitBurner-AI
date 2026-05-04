@@ -39,23 +39,72 @@ const COMPANION_NEEDS_STANEK = new Set(["stanek.js", "charge.js"]);
 // daemon writes after probing the candidates listed in
 // watch/ollama-candidates.json (or 127.0.0.1 if that file is absent).
 const AI_CONFIG = {
+  // ── Connectivity ─────────────────────────────────────────────────
   backend:      "ollama",
   ollamaHost:   "http://127.0.0.1:11434",
-  ollamaModel:  "llama3.1:8b",
+  // deepseek-coder-v2:16b is a coding-tuned model that's strong
+  // enough to read /ollama-actions.js, /ollama-player.js and emit
+  // coherent propose_patch payloads — the 8B fallback couldn't.
+  // Swap to llama3.1:70b or qwen2.5-coder:32b on a beefier box.
+  ollamaModel:  "deepseek-coder-v2:16b",
   claudeHost:   "http://localhost:3000",
   claudeModel:  "sonnet",
-  pollInterval: 60_000,
-  timeoutMs:    30_000
+  // 5-minute poll — the AI is the strategic layer; tactical work
+  // (root, backdoor, deploy) runs every 30 s in scb.js anyway.
+  // savings + jam-suppression keep it from doing anything dumb
+  // between cycles. Drop to 60-120 s if you want faster reactions.
+  pollInterval: 300_000,
+  // 16B-class inferences run ~30-60 s on most hardware. 30 s
+  // would constantly abort.
+  timeoutMs:     90_000,
+
+  // ── Model tuning ─────────────────────────────────────────────────
+  // Sampling temp: 0.0 = deterministic, 0.7 = creative. Low is
+  // generally better for actuator-style agents.
+  temperature:  0.2,
+  // Ollama context window — increase if recentActions starts getting
+  // truncated in your model's context.
+  numCtx:       8192,
+
+  // ── Self-context tuning ──────────────────────────────────────────
+  // How many recent /logs/ollama-player.txt lines to feed back into
+  // the prompt as state.recentActions.
+  recentLogLines: 30,
+  // How many times an identical (action, reason) pair must appear
+  // in the recent window before it's added to state.jammedActions
+  // and rejected by safetyCheck before it ever reaches the model.
+  jamThreshold:   3
 };
 
+// ─── Economy / safety policy ────────────────────────────────────────
+// Two cash floors with different jobs:
+//   • minCashReserve — HARD floor. Any action that would drop liquid
+//     home cash below this is rejected. Survival money.
+//   • savingsTarget  — SOFT target. While liquid cash is below
+//     (minCashReserve + savingsTarget), discretionary spending
+//     (buy_program, buy_server, upgrade_server, buy_augmentation,
+//     donate_faction) is blocked. Income-earning actions still run.
+//     Once savings unlocks, the AI may spend up to cashSpendCapPct
+//     of starting-cycle cash. A big spend that re-drops cash below
+//     the floor re-locks the cap.
 const SAFETY = {
-  maxActionsPerCycle: 5,
-  minCashReserve: 1_000_000,
-  minAugsToInstall: 5,
+  // Action limits
+  maxActionsPerCycle:     5,
+
+  // Cash policy
+  minCashReserve:         1_000_000,    // hard floor
+  savingsTarget:        100_000_000,    // soft target (scale with progress)
+  cashSpendCapPct:       90,            // per-cycle spend ceiling
+
+  // Augmentation gating
+  minAugsToInstall:       5,
   requireConfirmForReset: true,
-  blockedActions: ["soft_reset"],
-  logAllActions: true,
-  cashSpendCapPct: 90
+
+  // Hard deny list — never executed regardless of any other check
+  blockedActions:         ["soft_reset"],
+
+  // Logging — gates /logs/ollama-player.txt writes
+  logAllActions:          true
 };
 
 const DEPRECATED_SCRIPTS = [
@@ -85,7 +134,25 @@ export async function main(ns) {
 
   warnOnConflicts(ns);
 
+  // Publish the live economy policy to /Temp/economy.json every
+  // cycle so other in-game scripts (upgrader, future helpers) can
+  // honour the same minCashReserve / savingsTarget without each
+  // having its own hardcoded copy.
+  function writeEconomy() {
+    try {
+      ns.write("/Temp/economy.json", JSON.stringify({
+        ts: Date.now(),
+        minCashReserve:    SAFETY.minCashReserve,
+        savingsTarget:     SAFETY.savingsTarget,
+        cashSpendCapPct:   SAFETY.cashSpendCapPct,
+        savingsThreshold:  SAFETY.minCashReserve + SAFETY.savingsTarget
+      }, null, 2), "w");
+    } catch (_) {}
+  }
+  writeEconomy();
+
   while (true) {
+    writeEconomy();
     if (FLAGS.launchCompanions) launchCompanions(ns);
 
     if (FLAGS.autoContracts) {
@@ -442,7 +509,7 @@ async function ensureBackdoorWorkerExists(ns, filename) {
 async function ensureUpgraderExists(ns, filename) {
   if (ns.fileExists(filename, "home")) {
     const content = ns.read(filename);
-    if (content.includes("UPGRADER_VERSION_11_HOME_PCT")) return;
+    if (content.includes("UPGRADER_VERSION_12_SAVINGS_AWARE")) return;
 
     ns.rm(filename, "home");
     ns.print("INFO  Regenerating server-upgrader.js");
@@ -738,22 +805,22 @@ function fmt(ns, n) {
 const UPGRADER_CODE = String.raw`
 /**
  * server-upgrader.js
- * UPGRADER_VERSION_11_HOME_PCT
+ * UPGRADER_VERSION_12_SAVINGS_AWARE
  *
  * Fleet target scales with home RAM:
  *     target = clamp(START_RAM, cloudLimit, HOME_RAM_PCT * homeMaxRam)
- * snapped to the nearest lower power of 2 (purchased servers must
- * have a power-of-2 RAM).
+ * snapped to the nearest lower power of 2.
  *
  * Each cycle the upgrader:
- *   1. Buys a fresh START_RAM pserv if a slot is open (until MAX_SERVERS).
- *   2. Picks the smallest pserv below target and doubles its RAM
- *      (subject to the cash-reserve guard).
+ *   1. Reads the savings policy from /Temp/economy.json (written by
+ *      scb.js). While liquid cash < (minCashReserve + savingsTarget)
+ *      ALL purchases and upgrades pause — the upgrader sleeps until
+ *      cash recovers.
+ *   2. Buys a fresh START_RAM pserv if a slot is open.
+ *   3. Picks the smallest pserv below target and doubles its RAM
+ *      (subject to the per-cycle cash-reserve guard).
  *
- * When home RAM grows the target lifts automatically — no need to
- * restart the script. When the upgrader can't afford the next upgrade
- * for ANY server but slots remain, it falls back to buying a fresh
- * server at START_RAM (cheap, expands deploy capacity right away).
+ * When home RAM grows the target lifts automatically — no restart.
  */
 
 /** @param {NS} ns */
@@ -768,6 +835,7 @@ export async function main(ns) {
   const START_RAM_GB     = 8;
   const SERVER_PREFIX    = "pserv-";
   const TAIL_KEY         = "/Temp/server-upgrader-tail-open.txt";
+  const ECONOMY_FILE     = "/Temp/economy.json";
 
   ns.disableLog("ALL");
 
@@ -798,6 +866,12 @@ export async function main(ns) {
       ? money * (PERCENT_RESERVE / 100)
       : FIXED_RESERVE;
 
+    // Savings lock: read economy.json (scb.js writes it). While
+    // cash < (minCashReserve + savingsTarget) we pause spending.
+    const econ = readEconomy(ns, ECONOMY_FILE);
+    const savingsThreshold = (econ.minCashReserve || 0) + (econ.savingsTarget || 0);
+    const savingsLocked = savingsThreshold > 0 && money < savingsThreshold;
+
     const homeMax  = ns.getServerMaxRam("home");
     const cloudCap = ns.cloud.getRamLimit();
     const target   = computeTarget(homeMax, cloudCap, HOME_RAM_PCT, START_RAM_GB);
@@ -807,7 +881,15 @@ export async function main(ns) {
     ns.print("INFO  Owned: " + owned.length + "/" + MAX_SERVERS + " | Target: " + ns.format.ram(target) + " (10% of home " + ns.format.ram(homeMax) + ")");
     ns.print("INFO  Cash: $" + ns.format.number(money) + " | Reserve: $" + ns.format.number(reserve) + " (" + RESERVE_MODE + ")");
     ns.print("INFO  Spendable: $" + ns.format.number(Math.max(0, money - reserve)));
+    if (savingsLocked) {
+      ns.print("INFO  SAVINGS-LOCKED: cash $" + ns.format.number(money) + " < threshold $" + ns.format.number(savingsThreshold) + ". Skipping all purchases this cycle.");
+    }
     ns.print("─".repeat(48));
+
+    if (savingsLocked) {
+      await ns.sleep(CHECK_INTERVAL_MS);
+      continue;
+    }
 
     let bought = false;
 
@@ -884,6 +966,13 @@ function computeTarget(homeMax, cloudCap, pct, floorRam) {
   const exp    = Math.floor(Math.log2(Math.max(floorRam, raw)));
   const snapped = Math.pow(2, exp);
   return Math.max(floorRam, Math.min(snapped, cloudCap));
+}
+
+function readEconomy(ns, path) {
+  try {
+    if (!ns.fileExists(path, "home")) return {};
+    return JSON.parse(ns.read(path)) || {};
+  } catch (_) { return {}; }
 }
 
 function nextServerName(owned, prefix) {

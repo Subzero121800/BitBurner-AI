@@ -48,13 +48,17 @@ export async function main(ns) {
 
       const state = buildGameState(ns, safety);
 
-      // Self-context: feed the last ~30 entries of our own action log
+      // Self-context: feed the last N entries of our own action log
       // back into the prompt so the model can see what it just did and
       // avoid the "try the same forbidden upgrade 50 times in a row"
-      // failure mode.
-      const recent = readRecentLog(ns, 30);
+      // failure mode. Both the window and the jam threshold are
+      // configurable via AI_CONFIG (recentLogLines / jamThreshold).
+      const recent = readRecentLog(ns, Number(config.recentLogLines) || 30);
       state.recentActions = recent;
-      state.jammedActions = recentlyJammedActions(recent);
+      state.jammedActions = recentlyJammedActions(recent, {
+        window:    Number(config.recentLogLines) || 30,
+        threshold: Number(config.jamThreshold)   || 3
+      });
 
       const prompt = buildPrompt(state, safety);
       const actions = await askAI(ns, config, prompt);
@@ -129,6 +133,19 @@ function buildGameState(ns, safety) {
     safety: {
       minCashReserve: safety.minCashReserve,
       spendableCash: Math.max(0, money - safety.minCashReserve)
+    },
+
+    // Savings policy: while liquid cash is below
+    // (minCashReserve + savingsTarget), discretionary spending is
+    // locked. Only income-generating actions (deploy_hack, work_*,
+    // commit_crime, study, gym, hacknet income) are useful.
+    savings: {
+      target:   Number(safety.savingsTarget || 0),
+      floor:    Number(safety.minCashReserve || 0),
+      threshold: Number(safety.minCashReserve || 0) + Number(safety.savingsTarget || 0),
+      cash:     money,
+      shortBy:  Math.max(0, (Number(safety.minCashReserve || 0) + Number(safety.savingsTarget || 0)) - money),
+      unlocked: money >= (Number(safety.minCashReserve || 0) + Number(safety.savingsTarget || 0))
     },
 
     serverFleet: {
@@ -264,11 +281,16 @@ function buildPrompt(state, safety) {
     "",
     "Self-correction rules (READ THIS FIRST):",
     "- state.recentActions contains your own log of recently-attempted actions.",
-    "- state.jammedActions lists (action, reason) pairs you've tried 3+ times in a row that all failed. NEVER propose any of those actions again this cycle.",
+    "- state.jammedActions lists (action, reason) pairs you've tried multiple times in a row that all failed. NEVER propose any of those actions again this cycle.",
     "- If you see in state.jammedActions that upgrade_server is failing for cash reserve reasons, you cannot afford it — switch to deploy_hack, commit_crime, work_company, install_augmentations, or any income-generating action instead. Try again only after money grows.",
     "- If you see the same action succeed and you'd repeat it, only do so if the context has actually changed (e.g. a new server became available).",
     "- If you see a pattern in your log that looks like a code-level bug (the orchestrator or action library doing the wrong thing repeatedly), use read_file to inspect /ollama-actions.js or /ollama-player.js, then emit a propose_patch action so a human can review the fix. Do not write_generated_script in place of fixing core code; protected files require propose_patch.",
     "- You can also write helpful one-off helper scripts under /ai/generated/ via write_generated_script and run them via run_script if a specific automation would unblock you.",
+    "",
+    "Savings policy (READ THIS):",
+    "- state.savings.threshold = minCashReserve + savingsTarget. While state.savings.unlocked == false, all discretionary spending is blocked server-side: buy_program, buy_server, upgrade_server, buy_augmentation, donate_faction will all be rejected with SAVINGS-LOCKED.",
+    "- When state.savings.unlocked == false, focus exclusively on income generation: deploy_hack against the highest-value targets in state.targets, commit_crime, work_company, work_faction, study, gym, hacknet purchases/upgrades, or noop/wait if RAM is full.",
+    "- When state.savings.unlocked == true, spending is allowed up to safety.cashSpendCapPct of starting-cycle cash; prefer upgrades + augs that compound future income.",
     "",
     "Filesystem rules:",
     "- write_generated_script and delete_generated_script only work under /ai/generated/, /ai/scratch/, /Temp/, /logs/. Anywhere else is rejected.",
@@ -308,8 +330,8 @@ async function askOllama(ns, config, prompt) {
     prompt,
     stream: false,
     options: {
-      temperature: 0.2,
-      num_ctx: 8192
+      temperature: typeof config.temperature === "number" ? config.temperature : 0.2,
+      num_ctx:     typeof config.numCtx       === "number" ? config.numCtx       : 8192
     }
   };
 
@@ -455,6 +477,26 @@ function safetyCheck(ns, action, state, safety) {
       if (actionPart === sig) {
         return { ok: false, reason: "REPEAT-SUPPRESSED (" + j.count + "x): identical action just failed — try a different approach" };
       }
+    }
+  }
+
+  // Savings lock: while liquid cash hasn't crossed
+  // (minCashReserve + savingsTarget), block discretionary spend
+  // actions. Income-generating actions (deploy_hack, work_*,
+  // commit_crime, study, gym, hacknet, etc.) still pass through.
+  if (state.savings && state.savings.target > 0 && !state.savings.unlocked) {
+    const DISCRETIONARY = new Set([
+      "buy_program", "buy_server", "upgrade_server",
+      "buy_augmentation", "donate_faction"
+    ]);
+    if (DISCRETIONARY.has(action.action)) {
+      const short = state.savings.shortBy;
+      return {
+        ok: false,
+        reason: "SAVINGS-LOCKED: cash is $" + short.toLocaleString() +
+                " short of savings target ($" + state.savings.threshold.toLocaleString() +
+                "). Earn first; discretionary spend is paused."
+      };
     }
   }
 
