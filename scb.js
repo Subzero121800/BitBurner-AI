@@ -10,7 +10,7 @@ const FLAGS = {
   backdoor:          true,
   buyTor:            true,
   buyPrograms:       true,
-  serverUpgrader:    false,
+  serverUpgrader:    true,
   deployHackScripts: true,
   autoContracts:     true,
 
@@ -442,7 +442,7 @@ async function ensureBackdoorWorkerExists(ns, filename) {
 async function ensureUpgraderExists(ns, filename) {
   if (ns.fileExists(filename, "home")) {
     const content = ns.read(filename);
-    if (content.includes("UPGRADER_VERSION_10_BITBURNER_3_CLEAN")) return;
+    if (content.includes("UPGRADER_VERSION_11_HOME_PCT")) return;
 
     ns.rm(filename, "home");
     ns.print("INFO  Regenerating server-upgrader.js");
@@ -738,21 +738,36 @@ function fmt(ns, n) {
 const UPGRADER_CODE = String.raw`
 /**
  * server-upgrader.js
- * UPGRADER_VERSION_10_BITBURNER_3_CLEAN
+ * UPGRADER_VERSION_11_HOME_PCT
+ *
+ * Fleet target scales with home RAM:
+ *     target = clamp(START_RAM, cloudLimit, HOME_RAM_PCT * homeMaxRam)
+ * snapped to the nearest lower power of 2 (purchased servers must
+ * have a power-of-2 RAM).
+ *
+ * Each cycle the upgrader:
+ *   1. Buys a fresh START_RAM pserv if a slot is open (until MAX_SERVERS).
+ *   2. Picks the smallest pserv below target and doubles its RAM
+ *      (subject to the cash-reserve guard).
+ *
+ * When home RAM grows the target lifts automatically — no need to
+ * restart the script. When the upgrader can't afford the next upgrade
+ * for ANY server but slots remain, it falls back to buying a fresh
+ * server at START_RAM (cheap, expands deploy capacity right away).
  */
 
 /** @param {NS} ns */
 export async function main(ns) {
-  const ENABLED = true;
-  const TARGET_RAM_GB = 1024;
-  const RESERVE_MODE = "percent";
-  const FIXED_RESERVE = 500_000_000;
-  const PERCENT_RESERVE = 10;
+  const ENABLED          = true;
+  const HOME_RAM_PCT     = 0.10;          // pserv cap = 10% of home max RAM
+  const RESERVE_MODE     = "percent";
+  const FIXED_RESERVE    = 500_000_000;
+  const PERCENT_RESERVE  = 10;
   const CHECK_INTERVAL_MS = 30_000;
-  const MAX_SERVERS = ns.cloud.getServerLimit();
-  const START_RAM_GB = 8;
-  const SERVER_PREFIX = "pserv-";
-  const TAIL_KEY = "/Temp/server-upgrader-tail-open.txt";
+  const MAX_SERVERS      = ns.cloud.getServerLimit();
+  const START_RAM_GB     = 8;
+  const SERVER_PREFIX    = "pserv-";
+  const TAIL_KEY         = "/Temp/server-upgrader-tail-open.txt";
 
   ns.disableLog("ALL");
 
@@ -777,28 +792,36 @@ export async function main(ns) {
   }
 
   while (true) {
-    const owned = ns.cloud.getServerNames();
-    const money = ns.getServerMoneyAvailable("home");
+    const owned   = ns.cloud.getServerNames();
+    const money   = ns.getServerMoneyAvailable("home");
     const reserve = RESERVE_MODE === "percent"
       ? money * (PERCENT_RESERVE / 100)
       : FIXED_RESERVE;
 
+    const homeMax  = ns.getServerMaxRam("home");
+    const cloudCap = ns.cloud.getRamLimit();
+    const target   = computeTarget(homeMax, cloudCap, HOME_RAM_PCT, START_RAM_GB);
+
     ns.print("─".repeat(48));
     ns.print("INFO  Server Upgrader @ " + new Date().toLocaleTimeString());
-    ns.print("INFO  Owned: " + owned.length + "/" + MAX_SERVERS + " | Target: " + TARGET_RAM_GB + " GB");
+    ns.print("INFO  Owned: " + owned.length + "/" + MAX_SERVERS + " | Target: " + ns.format.ram(target) + " (10% of home " + ns.format.ram(homeMax) + ")");
     ns.print("INFO  Cash: $" + ns.format.number(money) + " | Reserve: $" + ns.format.number(reserve) + " (" + RESERVE_MODE + ")");
     ns.print("INFO  Spendable: $" + ns.format.number(Math.max(0, money - reserve)));
     ns.print("─".repeat(48));
 
+    let bought = false;
+
+    // 1) buy a new pserv at START_RAM if slots remain
     if (owned.length < MAX_SERVERS) {
       const cost = ns.cloud.getServerCost(START_RAM_GB);
 
       if (money - cost >= reserve) {
         const name = nextServerName(owned, SERVER_PREFIX);
-        const bought = ns.cloud.purchaseServer(name, START_RAM_GB);
+        const result = ns.cloud.purchaseServer(name, START_RAM_GB);
 
-        if (bought) {
-          ns.print("SUCCESS  Bought " + bought + " (" + START_RAM_GB + " GB)");
+        if (result) {
+          ns.print("SUCCESS  Bought " + result + " (" + ns.format.ram(START_RAM_GB) + ")");
+          bought = true;
         } else {
           ns.print("ERROR  Purchase failed");
         }
@@ -807,17 +830,19 @@ export async function main(ns) {
       }
     }
 
+    // 2) upgrade the smallest pserv below target — pick the cheapest
+    //    next-step. If we just bought a new one this cycle, skip the
+    //    upgrade pass to keep cash for more new pservs.
     const refreshed = ns.cloud.getServerNames();
-
     const upgradeable = refreshed
       .map((srv) => ({ srv, ram: ns.getServerMaxRam(srv) }))
-      .filter((s) => s.ram < TARGET_RAM_GB)
+      .filter((s) => s.ram < target)
       .sort((a, b) => a.ram - b.ram);
 
-    if (upgradeable.length > 0) {
-      const pick = upgradeable[0];
-      const nextRam = pick.ram * 2;
-      const cost = ns.cloud.getServerUpgradeCost(pick.srv, nextRam);
+    if (!bought && upgradeable.length > 0) {
+      const pick    = upgradeable[0];
+      const nextRam = Math.min(target, pick.ram * 2);
+      const cost    = ns.cloud.getServerUpgradeCost(pick.srv, nextRam);
       const cashNow = ns.getServerMoneyAvailable("home");
       const reserveNow = RESERVE_MODE === "percent"
         ? cashNow * (PERCENT_RESERVE / 100)
@@ -826,12 +851,13 @@ export async function main(ns) {
       if (cost < 0 || cost === Infinity) {
         ns.print("WARN  " + pick.srv + " cannot compute upgrade cost");
       } else if (cashNow - cost < reserveNow) {
+        // Couldn't afford the upgrade. If slots remain, falling back
+        // to buying a fresh START_RAM pserv on the next cycle is more
+        // useful than sitting idle — the cycle loop will handle it.
         ns.print("WARN  " + pick.srv + " (" + ns.format.ram(pick.ram) + " -> " + ns.format.ram(nextRam) + ") $" + ns.format.number(cost) + " exceeds budget");
       } else {
         ns.killall(pick.srv);
-
         const success = ns.cloud.upgradeServer(pick.srv, nextRam);
-
         if (success) {
           ns.print("SUCCESS  " + pick.srv + ": " + ns.format.ram(pick.ram) + " -> " + ns.format.ram(nextRam) + " $" + ns.format.number(cost));
         } else {
@@ -840,20 +866,24 @@ export async function main(ns) {
       }
     }
 
-    const finalOwned = ns.cloud.getServerNames();
-    const belowTarget = finalOwned.filter((srv) => ns.getServerMaxRam(srv) < TARGET_RAM_GB).length;
+    const finalOwned   = ns.cloud.getServerNames();
+    const belowTarget  = finalOwned.filter((srv) => ns.getServerMaxRam(srv) < target).length;
 
     if (belowTarget === 0 && finalOwned.length >= MAX_SERVERS) {
-      ns.print("INFO  All " + finalOwned.length + " servers at " + TARGET_RAM_GB + " GB+");
-      return;
-    }
-
-    if (belowTarget > 0) {
-      ns.print("INFO  " + belowTarget + " server(s) still below target");
+      ns.print("INFO  All " + finalOwned.length + " servers at " + ns.format.ram(target) + "+. Sleeping (will re-check after home RAM grows).");
+    } else if (belowTarget > 0) {
+      ns.print("INFO  " + belowTarget + " server(s) still below " + ns.format.ram(target));
     }
 
     await ns.sleep(CHECK_INTERVAL_MS);
   }
+}
+
+function computeTarget(homeMax, cloudCap, pct, floorRam) {
+  const raw    = Math.min(cloudCap, Math.max(floorRam, homeMax * pct));
+  const exp    = Math.floor(Math.log2(Math.max(floorRam, raw)));
+  const snapped = Math.pow(2, exp);
+  return Math.max(floorRam, Math.min(snapped, cloudCap));
 }
 
 function nextServerName(owned, prefix) {
