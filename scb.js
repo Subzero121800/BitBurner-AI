@@ -54,9 +54,13 @@ const FLAGS = {
     // both at once — scb.js prints a conflict warning if you do.
     "autopilot.js":               false,
 
-    // Our own managers (ship in this repo, no external deps)
-    "gang-manager.js":            true,    // gang autopilot — recruit, task, ascend, equip, warfare
-    "bladeburner-manager.js":     true,    // bladeburner autopilot — actions, skills, anti-chaos
+    // Our own managers (ship in this repo, no external deps).
+    // All three are autonomous with safe defaults AND can be steered
+    // by the AI player via /Temp/<manager>-directives.json
+    // (set_sleeve_plan / set_gang_plan / set_bladeburner_plan).
+    "gang-manager.js":            true,    // gang autopilot — needs SF-2
+    "bladeburner-manager.js":     true,    // bladeburner autopilot — needs SF-6
+    "sleeve-manager.js":          true,    // sleeve autopilot — needs SF-10
 
     // Individual managers (user-supplied; skipped silently if missing)
     "stats.js":                   true,

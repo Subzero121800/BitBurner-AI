@@ -33,6 +33,19 @@ const WARFARE_POWER_RATIO  = 1.2;     // engage when our power > avg * ratio
 const LOG_FILE             = "/logs/gang.txt";
 const LOG_PREV             = "/logs/gang.1.txt";
 const LOG_MAX_BYTES        = 256_000;
+const DIRECTIVES_FILE      = "/Temp/gang-directives.json";
+const STATE_FILE           = "/Temp/gang-state.json";
+const DIRECTIVE_STALE_MS   = 10 * 60 * 1000;
+const DEFAULT_FACTION      = "Slum Snakes";
+
+// AI directive shape (set via `set_gang_plan` action):
+//   {
+//     "ts": <epoch ms>,
+//     "createFaction":   "Slum Snakes",   // override on createGang
+//     "memberOverrides": { "Alpha": "Vigilante Justice", ... },
+//     "allowEquipment":  true,            // false to pause equipment buying
+//     "warfareOverride": null             // true | false | null (=auto)
+//   }
 
 const MEMBER_NAMES = [
   "Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot",
@@ -60,12 +73,15 @@ export async function main(ns) {
 
 /** @param {NS} ns */
 async function tick(ns) {
+  const directives = readDirectives(ns);
+
   if (!ns.gang.inGang()) {
-    if (!ns.gang.createGang("Slum Snakes")) {
-      ns.print("INFO  not in a gang yet — need karma ≤ -54000 or Slum Snakes membership");
+    const faction = directives.createFaction || DEFAULT_FACTION;
+    if (!ns.gang.createGang(faction)) {
+      ns.print("INFO  not in a gang yet — need karma ≤ -54000 or " + faction + " membership");
       return;
     }
-    appendLog(ns, "JOIN created gang via Slum Snakes");
+    appendLog(ns, "JOIN created gang via " + faction);
   }
 
   const info    = ns.gang.getGangInformation();
@@ -81,12 +97,15 @@ async function tick(ns) {
     appendLog(ns, "RECRUIT " + name + " (now " + members.length + ")");
   }
 
-  // 2) task each member
+  // 2) task each member — directive overrides take precedence
+  const memberOverrides = directives.memberOverrides || {};
   for (const name of members) {
     const m = ns.gang.getMemberInformation(name);
     const sum = (m.str || 0) + (m.def || 0) + (m.dex || 0) + (m.agi || 0);
     let task;
-    if (sum < 200) {
+    if (memberOverrides[name]) {
+      task = memberOverrides[name];               // AI override
+    } else if (sum < 200) {
       task = "Train Combat";
     } else if (wantedRatio > 1) {
       task = "Vigilante Justice";
@@ -97,7 +116,8 @@ async function tick(ns) {
     }
     if (m.task !== task) {
       if (ns.gang.setMemberTask(name, task)) {
-        appendLog(ns, "TASK " + name + " -> " + task);
+        appendLog(ns, "TASK " + name + " -> " + task +
+                      (memberOverrides[name] ? " (directive)" : ""));
       }
     }
   }
@@ -115,9 +135,10 @@ async function tick(ns) {
     }
   }
 
-  // 4) equipment — only when savings unlocked, and only items we can
-  //    afford without crossing the savings threshold.
-  if (econ && econ.savingsThreshold !== undefined) {
+  // 4) equipment — only when savings unlocked, AI hasn't disabled it,
+  //    and only items we can afford without crossing the threshold.
+  const equipAllowed = directives.allowEquipment !== false;
+  if (equipAllowed && econ && econ.savingsThreshold !== undefined) {
     const cash      = ns.getServerMoneyAvailable("home");
     const threshold = econ.savingsThreshold;
     const unlocked  = cash >= threshold;
@@ -139,7 +160,7 @@ async function tick(ns) {
     }
   }
 
-  // 5) territory warfare — engage only when we dominate
+  // 5) territory warfare — directive override OR auto-engage when dominant
   try {
     const all = ns.gang.getAllGangInformation();
     const ours = all[info.faction];
@@ -149,10 +170,16 @@ async function tick(ns) {
     const avgOther = otherPowers.length
       ? otherPowers.reduce((s, p) => s + p, 0) / otherPowers.length
       : 0;
-    const dominate = ours && ours.power > avgOther * WARFARE_POWER_RATIO;
+    const auto = ours && ours.power > avgOther * WARFARE_POWER_RATIO;
+    const dominate = (typeof directives.warfareOverride === "boolean")
+      ? directives.warfareOverride
+      : auto;
     if (info.territoryWarfareEngaged !== dominate) {
       ns.gang.setTerritoryWarfare(dominate);
-      appendLog(ns, "WARFARE " + (dominate ? "ON" : "OFF") + " (us=" + (ours?.power || 0).toFixed(0) + " avg=" + avgOther.toFixed(0) + ")");
+      appendLog(ns, "WARFARE " + (dominate ? "ON" : "OFF") +
+                    " (us=" + (ours?.power || 0).toFixed(0) +
+                    " avg="  + avgOther.toFixed(0) + ")" +
+                    (typeof directives.warfareOverride === "boolean" ? " (directive)" : ""));
     }
   } catch (_) { /* warfare API can throw early-game */ }
 
@@ -160,6 +187,30 @@ async function tick(ns) {
            " respect=" + fmt(info.respect) +
            " wanted=" + fmt(info.wantedLevel) +
            " power=" + fmt(info.power));
+
+  // Publish per-cycle state for the AI player to read.
+  try {
+    ns.write(STATE_FILE, JSON.stringify({
+      ts:        Date.now(),
+      inGang:    true,
+      faction:   info.faction,
+      members:   members.length,
+      respect:   info.respect,
+      wanted:    info.wantedLevel,
+      power:     info.power,
+      territory: info.territory,
+      warfare:   info.territoryWarfareEngaged,
+    }, null, 2), "w");
+  } catch (_) {}
+}
+
+function readDirectives(ns) {
+  try {
+    if (!ns.fileExists(DIRECTIVES_FILE, "home")) return {};
+    const raw = JSON.parse(ns.read(DIRECTIVES_FILE)) || {};
+    if (raw.ts && Date.now() - raw.ts > DIRECTIVE_STALE_MS) return {};
+    return raw;
+  } catch (_) { return {}; }
 }
 
 function fmt(n) {

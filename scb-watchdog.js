@@ -1,6 +1,6 @@
 /** @param {NS} ns */
 export async function main(ns) {
-  // WATCHDOG_VERSION_6
+  // WATCHDOG_VERSION_7
   ns.disableLog("ALL");
   try { ns.ui?.openTail?.(); } catch (_) {}
 
@@ -22,6 +22,7 @@ export async function main(ns) {
     { file: "/logs/ollama-player.txt",      name: "ollama-player" },
     { file: "/logs/gang.txt",               name: "gang" },
     { file: "/logs/bladeburner.txt",        name: "bladeburner" },
+    { file: "/logs/sleeve.txt",             name: "sleeve" },
   ];
 
   let lastMarker = readFileSafe(RESTART_FILE);

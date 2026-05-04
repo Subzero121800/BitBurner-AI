@@ -159,6 +159,17 @@ function buildGameState(ns, safety) {
     // avoid actions that spawn more home-side scripts.
     budget: getBudget(ns),
 
+    // Manager state — what the autonomous companions are doing right
+    // now. Each manager publishes a JSON snapshot every cycle. The
+    // AI can steer them via set_sleeve_plan / set_gang_plan /
+    // set_bladeburner_plan. null entries mean the companion isn't
+    // running (or its SF isn't unlocked).
+    managers: {
+      sleeve:      readJson(ns, "/Temp/sleeve-state.json"),
+      gang:        readJson(ns, "/Temp/gang-state.json"),
+      bladeburner: readJson(ns, "/Temp/bladeburner-state.json")
+    },
+
     serverFleet: {
       ownedCount: purchased.length,
       limit: serverLimit,
@@ -307,6 +318,14 @@ function buildPrompt(state, safety) {
     "- state.systemHealth.syncStale: when true the host can no longer deliver fresh code into the game (the heartbeat file has gone stale). The state you're seeing may be hours old.",
     "- When syncStale is true, your ENTIRE response must be exactly: [{\"action\":\"reconnect_remote_api\"}] — nothing else. Don't deploy, don't buy, don't propose patches. The reconnect action calls the in-game DOM to click Options→Remote API→Connect. After it succeeds, normal cycles resume.",
     "- When syncStale is false, ignore reconnect_remote_api entirely.",
+    "",
+    "Manager steering (autonomous companions you can override):",
+    "- state.managers.{sleeve, gang, bladeburner} is each manager's per-cycle state snapshot (null if it isn't running). Use it to decide whether to override their default behaviour.",
+    "- To steer them, emit set_sleeve_plan / set_gang_plan / set_bladeburner_plan with a `plan` object. The directive expires after 10 minutes if you don't refresh, so the manager falls back to defaults if you go silent.",
+    "- Example sleeve plan: {default:{task:'commit_crime',crime:'Homicide'},sleeves:{0:{task:'synchronize'}}}",
+    "- Example gang plan: {memberOverrides:{Alpha:'Vigilante Justice'},allowEquipment:false,warfareOverride:false}",
+    "- Example bladeburner plan: {actionOverride:{type:'Operation',name:'Assassination'},antiChaosThreshold:30}",
+    "- Don't set a plan if the manager's default is doing the right thing — overrides are for when you have specific strategic intent.",
     "",
     "RAM budget (only relevant if state.budget.capped is true):",
     "- state.budget.maxInGameRamGB is the user's cap on home-side scripts.",
@@ -764,6 +783,13 @@ function resolveOllamaHost(ns, fallback) {
   } catch (_) {
     return fallback;
   }
+}
+
+function readJson(ns, path) {
+  try {
+    if (!ns.fileExists(path, "home")) return null;
+    return JSON.parse(ns.read(path)) || null;
+  } catch (_) { return null; }
 }
 
 function getBudget(ns) {

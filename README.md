@@ -464,7 +464,7 @@ run /ollama-actions.js --list                      # dump the action schema
 |---------------------------|--------------------|----------------------------------------------------------------------------------------------|
 | **SF-2** (Gangs)          | `ns.gang.*`        | `gang-manager.js` idles cleanly. AI's `gang_recruit` / `gang_assign` / `gang_ascend` throw.  |
 | **SF-6** (Bladeburners)   | `ns.bladeburner.*` | `bladeburner-manager.js` idles cleanly. AI's `bb_action` / `bb_skill` throw.                 |
-| **SF-10** (Sleeves)       | `ns.sleeve.*`      | AI's `sleeve_task` action only. Other features unaffected.                                   |
+| **SF-10** (Sleeves)       | `ns.sleeve.*`      | `sleeve-manager.js` cleanly idles. AI's `sleeve_task` and `set_sleeve_plan` actions throw.   |
 | **SF-13** (Stanek's Gift) | `ns.stanek.*`      | Stanek companion only. `scb.js` auto-skips Stanek-dependent companions if Gift not accepted. |
 
 On a fresh BN-1 install you have **none** of the optional SFs — disable the gang + bladeburner managers in `scb.js`:

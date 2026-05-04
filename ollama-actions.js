@@ -75,7 +75,16 @@ export const ACTION_SCHEMA = [
   { action: "propose_patch",          args: ["target", "content", "reason"], desc: "Propose a change to a PROTECTED file. Writes /ai/patches/pending-patch.json — a human runs /approve-patch.js to apply" },
 
   // ─── System health ────────────────────────────────────────────────
-  { action: "reconnect_remote_api",   args: [],                                      desc: "Best-effort programmatic Options → Remote API → Connect via DOM. Use when state.systemHealth.syncStale is true." }
+  { action: "reconnect_remote_api",   args: [],                                      desc: "Best-effort programmatic Options → Remote API → Connect via DOM. Use when state.systemHealth.syncStale is true." },
+
+  // ─── Manager directives (steer the autonomous companions) ────────
+  // Each writes /Temp/<manager>-directives.json which the manager
+  // reads each cycle and applies on top of its safe-default heuristic.
+  // Plans expire after 10 minutes if the manager doesn't see a fresh
+  // ts, so a stale AI doesn't steer indefinitely.
+  { action: "set_sleeve_plan",        args: ["plan"], desc: "Steer sleeve-manager. plan = { default?:{task,...}, sleeves?:{ '0':{task,...} } }. Tasks: shock_recovery|synchronize|idle|commit_crime|gym|study|company_work|faction_work" },
+  { action: "set_gang_plan",          args: ["plan"], desc: "Steer gang-manager. plan = { createFaction?, memberOverrides?:{name:task}, allowEquipment?:bool, warfareOverride?:bool|null }" },
+  { action: "set_bladeburner_plan",   args: ["plan"], desc: "Steer bladeburner-manager. plan = { actionOverride?:{type,name}, antiChaosThreshold?:number, skillPriorities?:[name,...] }" }
 ];
 
 const VALID_ACTIONS = new Set(ACTION_SCHEMA.map((a) => a.action));
@@ -237,6 +246,13 @@ export async function executeAction(ns, action) {
 
       case "reconnect_remote_api":
         return await aiReconnectRemoteApi(ns);
+
+      case "set_sleeve_plan":
+        return aiSetDirective(ns, "/Temp/sleeve-directives.json", action.plan, "sleeve");
+      case "set_gang_plan":
+        return aiSetDirective(ns, "/Temp/gang-directives.json", action.plan, "gang");
+      case "set_bladeburner_plan":
+        return aiSetDirective(ns, "/Temp/bladeburner-directives.json", action.plan, "bladeburner");
 
       default:
         return fail("unknown action: " + action.action);
@@ -935,6 +951,21 @@ function aiCopyScript(ns, action) {
     return ok2 ? ok("copied " + p + " → " + dst) : fail("scp returned false");
   } catch (e) {
     return fail("copy_script threw: " + String(e.message || e));
+  }
+}
+
+function aiSetDirective(ns, path, plan, kind) {
+  if (!plan || typeof plan !== "object" || Array.isArray(plan)) {
+    return fail(kind + " plan must be a JSON object");
+  }
+  const wrapped = { ...plan, ts: Date.now() };
+  const body = JSON.stringify(wrapped, null, 2);
+  if (body.length > 50_000) return fail(kind + " plan > 50 KB, refused");
+  try {
+    ns.write(path, body, "w");
+    return ok("wrote " + kind + " directive (" + body.length + " B) to " + path);
+  } catch (e) {
+    return fail("set_" + kind + "_plan threw: " + String(e.message || e));
   }
 }
 

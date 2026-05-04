@@ -26,13 +26,24 @@
 
 const POLL_MS              = 30_000;
 const JOIN_STAT_THRESHOLD  = 100;     // str/def/dex/agi each
-const CHAOS_THRESHOLD      = 50;
+const CHAOS_THRESHOLD      = 50;      // can be overridden by directive
 const MIN_SUCCESS_CHANCE   = 0.6;
 const ANTI_CHAOS_OPERATION = "Stealth Retirement Operation";
 const FALLBACK_GENERAL     = "Field Analysis";
 const LOG_FILE             = "/logs/bladeburner.txt";
 const LOG_PREV             = "/logs/bladeburner.1.txt";
 const LOG_MAX_BYTES        = 256_000;
+const DIRECTIVES_FILE      = "/Temp/bladeburner-directives.json";
+const STATE_FILE           = "/Temp/bladeburner-state.json";
+const DIRECTIVE_STALE_MS   = 10 * 60 * 1000;
+
+// AI directive shape (set via `set_bladeburner_plan` action):
+//   {
+//     "ts": <epoch ms>,
+//     "actionOverride":     { "type": "Operation", "name": "Assassination" },
+//     "antiChaosThreshold": 30,
+//     "skillPriorities":    ["Reaper", "Cloak", ...]   // overrides default order
+//   }
 
 const SKILL_PRIORITIES = [
   "Blade's Intuition",          // success rate on contracts/ops
@@ -68,6 +79,14 @@ export async function main(ns) {
 
 /** @param {NS} ns */
 async function tick(ns) {
+  const directives = readDirectives(ns);
+  const skillPriorities  = Array.isArray(directives.skillPriorities) && directives.skillPriorities.length
+    ? directives.skillPriorities
+    : SKILL_PRIORITIES;
+  const chaosThreshold   = (typeof directives.antiChaosThreshold === "number")
+    ? directives.antiChaosThreshold
+    : CHAOS_THRESHOLD;
+
   if (!ns.bladeburner.inBladeburner()) {
     const skills = ns.getPlayer().skills;
     if (skills.strength < JOIN_STAT_THRESHOLD ||
@@ -89,7 +108,7 @@ async function tick(ns) {
   let bought = 0;
   while (sp > 0) {
     let found = false;
-    for (const name of SKILL_PRIORITIES) {
+    for (const name of skillPriorities) {
       const cost = safe(() => ns.bladeburner.getSkillUpgradeCost(name));
       if (cost == null || cost === Infinity) continue;
       if (sp < cost) continue;
@@ -109,8 +128,17 @@ async function tick(ns) {
   }
   if (bought > 0) appendLog(ns, "SKILLS bought " + bought + " level(s); SP left=" + sp);
 
-  // 2) pick action
-  const choice = pickAction(ns);
+  // 2) pick action — directive override OR auto-selection
+  let choice;
+  if (directives.actionOverride && directives.actionOverride.type && directives.actionOverride.name) {
+    choice = {
+      type: directives.actionOverride.type,
+      name: directives.actionOverride.name,
+      reason: "directive"
+    };
+  } else {
+    choice = pickAction(ns, chaosThreshold);
+  }
   if (!choice) {
     ns.print("INFO  no viable action this cycle");
     return;
@@ -128,14 +156,39 @@ async function tick(ns) {
   } else {
     appendLog(ns, "FAIL  startAction " + choice.type + " / " + choice.name);
   }
+
+  // Publish per-cycle state for the AI player.
+  try {
+    ns.write(STATE_FILE, JSON.stringify({
+      ts:        Date.now(),
+      inBB:      true,
+      rank:      safe(() => ns.bladeburner.getRank()) || 0,
+      skillPts:  safe(() => ns.bladeburner.getSkillPoints()) || 0,
+      action:    { type: choice.type, name: choice.name },
+      cityChaos: CITIES.reduce((acc, c) => {
+        const v = safe(() => ns.bladeburner.getCityChaos(c));
+        if (v != null) acc[c] = Math.round(v);
+        return acc;
+      }, {})
+    }, null, 2), "w");
+  } catch (_) {}
+}
+
+function readDirectives(ns) {
+  try {
+    if (!ns.fileExists(DIRECTIVES_FILE, "home")) return {};
+    const raw = JSON.parse(ns.read(DIRECTIVES_FILE)) || {};
+    if (raw.ts && Date.now() - raw.ts > DIRECTIVE_STALE_MS) return {};
+    return raw;
+  } catch (_) { return {}; }
 }
 
 /** @param {NS} ns */
-function pickAction(ns) {
+function pickAction(ns, chaosThreshold) {
   // Anti-chaos: any city above threshold? Travel + retirement.
   for (const city of CITIES) {
     const chaos = safe(() => ns.bladeburner.getCityChaos(city));
-    if (chaos != null && chaos > CHAOS_THRESHOLD) {
+    if (chaos != null && chaos > chaosThreshold) {
       // Travel to that city before running the op.
       try { ns.bladeburner.switchCity(city); } catch (_) {}
       const remaining = safe(() => ns.bladeburner.getActionCountRemaining("Operation", ANTI_CHAOS_OPERATION));
