@@ -446,13 +446,40 @@ run /ollama-actions.js --list                      # dump the action schema
 </details>
 
 <details>
-<summary><strong>📋 Requirements</strong></summary>
+<summary><strong>📋 Requirements & Source-File gating</strong></summary>
 <br>
 
+**Required to run anything in this repo:**
+
 * **Bitburner 3.0.0+** — uses `ns.cloud.*`, `ns.ui.openTail`, etc.
-* **Source-File 4** (Singularity API) — `scb.js` calls `ns.singularity.*` for backdoor + program purchase.
-* **Node ≥ 18** for the local services (zero npm deps — pure stdlib).
-* **Ollama** running somewhere reachable, OR `claude` CLI on PATH if you flip to the Claude backend.
+* **Source-File 4** (Singularity) — at any level. The orchestrator (`scb.js`) cannot start without it: it calls `ns.singularity.*` to buy the TOR router + port crackers, install backdoors, and execute every `work_*` / `study` / `gym` / `commit_crime` / `install_augmentations` / `soft_reset` / `travel` / `connect` / `buy_program` / `buy_augmentation` / `donate_faction` action.
+* **Node ≥ 18** on the host (zero npm deps — pure stdlib).
+* **Ollama** running somewhere reachable, OR `claude` CLI on PATH for the Claude-bridge backend.
+
+**Optional Source-Files — features that gracefully no-op without them:**
+
+| Source-File               | Gates              | Affected components                                                                          |
+|---------------------------|--------------------|----------------------------------------------------------------------------------------------|
+| **SF-2** (Gangs)          | `ns.gang.*`        | `gang-manager.js` idles cleanly. AI's `gang_recruit` / `gang_assign` / `gang_ascend` throw.  |
+| **SF-6** (Bladeburners)   | `ns.bladeburner.*` | `bladeburner-manager.js` idles cleanly. AI's `bb_action` / `bb_skill` throw.                 |
+| **SF-10** (Sleeves)       | `ns.sleeve.*`      | AI's `sleeve_task` action only. Other features unaffected.                                   |
+| **SF-13** (Stanek's Gift) | `ns.stanek.*`      | Stanek companion only. `scb.js` auto-skips Stanek-dependent companions if Gift not accepted. |
+
+On a fresh BN-1 install you have **none** of the optional SFs — disable the gang + bladeburner managers in `scb.js`:
+
+```js
+// scb.js
+const FLAGS = {
+  // ...
+  companions: {
+    "gang-manager.js":            false,   // needs SF-2
+    "bladeburner-manager.js":     false,   // needs SF-6
+    // ...
+  }
+};
+```
+
+The AI player itself runs without SF-2/6/10 — it just won't propose those gated actions in practice once it sees them rejected once.
 
 </details>
 
