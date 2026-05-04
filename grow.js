@@ -2,5 +2,11 @@
 export async function main(ns) {
   const target = ns.args[0];
   if (!target) { ns.tprint("usage: grow.js <target>"); return; }
-  while (true) await ns.grow(target);
+  while (true) {
+    if (!ns.hasRootAccess(target)) {
+      ns.print("WARN  no root on " + target + " — exiting");
+      return;
+    }
+    await ns.grow(target);
+  }
 }

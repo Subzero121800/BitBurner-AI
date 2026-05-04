@@ -20,12 +20,48 @@ const FLAGS = {
   // Autonomous AI player (Ollama backend — local or LAN endpoint)
   ollamaPlayer:      true,
 
-  // Bring-your-own-companions launcher. Empty by default — add
-  // entries like `"my-stockmaster.js": true` if you maintain extra
-  // self-running managers on `home`. Each is launched once via
-  // ns.exec and expected to loop on its own.
-  launchCompanions:  false,
-  companions:        {}
+  // Bring-your-own-companions launcher.
+  //
+  // scb.js doesn't ship the companion scripts — you provide them
+  // yourself (the Bryden / Insight framework is the most common
+  // source). scb.js calls ns.fileExists(name, "home") before each
+  // launch and silently skips anything missing, so a partial set
+  // is fine. Toggle `false` to keep an entry but disable it.
+  //
+  // To wire up your own helpers: drop the .js into the workspace,
+  // add a `"yourscript.js": true` line below, save. The watchdog
+  // will hot-reload scb.js and launch it on the next cycle.
+  launchCompanions:  true,
+  companions: {
+    // Bryden orchestrator — turn ON to delegate everything; turn
+    // OFF to drive with the individual managers below. Don't enable
+    // both at once — scb.js prints a conflict warning if you do.
+    "autopilot.js":               false,
+
+    // Individual managers (active when autopilot.js is OFF)
+    "stats.js":                   true,
+    "gangs.js":                   true,
+    "bladeburner.js":             true,
+    "stockmaster.js":             false,
+    "sleeve.js":                  false,
+    "faction-manager.js":         false,
+    "hacknet-upgrade-manager.js": true,
+    "host-manager.js":            false,
+    "spend-hacknet-hashes.js":    true,
+
+    // Hacking workers (the per-server hack/grow/weaken scripts run
+    // automatically via FLAGS.deployHackScripts; these are
+    // standalone managers that some frameworks ship)
+    "hackall.js":                 false,
+    "n00dles.js":                 false,
+
+    // Stanek (auto-skipped if Gift not accepted)
+    "stanek.js":                  true,
+
+    // The AI player is launched separately via FLAGS.ollamaPlayer
+    // — leave this false to avoid double-spawn.
+    "ollama-player.js":           false
+  }
 };
 
 const COMPANION_ARGS = {

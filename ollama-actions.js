@@ -250,6 +250,9 @@ function deployBasic(ns, target, op) {
   if (!target || !serverExists(ns, target)) {
     return fail("invalid target: " + target);
   }
+  if (!ns.hasRootAccess(target)) {
+    return fail("no root access on target: " + target + " — call backdoor or wait for scb.js to root it");
+  }
 
   const file = op === "hack" ? "hack.js" : op === "grow" ? "grow.js" : "weaken.js";
   ensureLoopWorker(ns, file);
@@ -282,6 +285,9 @@ function deployBasic(ns, target, op) {
 function deploySmartSplit(ns, target, requestedServer) {
   if (!target || !serverExists(ns, target)) {
     return fail("invalid target: " + target);
+  }
+  if (!ns.hasRootAccess(target)) {
+    return fail("no root access on target: " + target + " — workers would die on first call");
   }
 
   ensureLoopWorker(ns, "hack.js");
