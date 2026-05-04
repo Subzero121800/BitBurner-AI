@@ -2,26 +2,7 @@
 
 A modular automation stack for [Bitburner](https://bitburner-official.github.io/), with an autonomous AI player that uses **Ollama** (local or LAN) to make decisions and a guard‑railed file‑system surface so the model can extend itself without bricking your save.
 
-```
-┌───────────────────────────┐    save     ┌──────────────────────┐    WS :12525    ┌──────────────────┐
-│  your editor / VS Code    │ ──────────▶ │  bitburner-filesync  │ ──────────────▶ │  Bitburner game  │
-└───────────────────────────┘             └──────────────────────┘                 └──────────────────┘
-                                                  ▲                                          │
-                                                  │ /Temp/scb-restart.txt                    │
-                                                  │ /Temp/ollama-host.txt                    │
-                                                  │ /Temp/scb-heartbeat.txt                  │
-                                          ┌───────┴──────────┐                               │
-                                          │   scb-watch.js   │ ◀───────── status, logs ──────┘
-                                          │  (file watcher,  │
-                                          │   Ollama probe,  │             ┌────────────────────────┐
-                                          │   bridge restart)│             │   /scb.js              │
-                                          └──────────────────┘             │     ↓                  │
-                                                  │                        │   /scb-watchdog.js     │ ──── hot-reload scb.js
-                                                  │                        │   /ollama-player.js    │ ──── HTTP ──▶ Ollama @ LAN
-                                                  ▼                        │   /ollama-actions.js   │
-                                          /Temp/ollama-host.txt            │   /approve-patch.js    │ ──── human review of AI patches
-                                                                           └────────────────────────┘
-```
+![SCB Bitburner architecture: editor → filesync → game, with scb-watch on the host writing /Temp markers, and the in-game scb / watchdog / ollama-player / approve-patch layer talking to Ollama](docs/architecture.svg)
 
 ---
 
