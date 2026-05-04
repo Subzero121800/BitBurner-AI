@@ -366,8 +366,24 @@ export async function main(ns) {
       ns.print("WARN  Skipped (need more ports than " + portCrax.length + "): " + needPorts.length + " — " + needPorts.slice(0, 5).join(", ") + (needPorts.length > 5 ? ", +" + (needPorts.length - 5) + " more" : ""));
     }
 
+    // ─── Pserv deploy pass ────────────────────────────────────────
+    // The scan-and-root loop above skips purchased servers (they're
+    // already rooted by definition). They DO need workers though,
+    // and once they get freshly upgraded they sit empty. Sweep them
+    // here: deploy hack/grow/weaken targeting our best server, or
+    // fall back to share() when no useful target exists.
+    let pservDeployed = 0;
+    let pservShared   = 0;
+    if (FLAGS.deployHackScripts) {
+      const result = deployToPservs(ns);
+      pservDeployed = result.deployed;
+      pservShared   = result.shared;
+      if (pservDeployed) ns.print("INFO  Pserv deploys: " + pservDeployed);
+      if (pservShared)   ns.print("INFO  Pserv share workers: " + pservShared + " (no hackable target → faction-rep boost)");
+    }
+
     ns.print("");
-    ns.print("INFO  Rooted: " + rooted + " | Backdoor: " + backdoored + " | Deployed: " + deployed + " | Skipped: " + skipped);
+    ns.print("INFO  Rooted: " + rooted + " | Backdoor: " + backdoored + " | Deployed: " + deployed + "+" + pservDeployed + " | Shared: " + pservShared + " | Skipped: " + skipped);
     ns.print("INFO  Sleeping " + CYCLE_MS / 1000 + "s until next scan");
     ns.print("");
 
@@ -453,6 +469,66 @@ function stanekIsActive(ns) {
   } catch {
     return false;
   }
+}
+
+// Sweep all purchased servers (pserv-*). For each: if it has free
+// RAM and a worker isn't already running, deploy hack/grow/weaken
+// against the best target. If no target is reachable yet OR all
+// our cracked targets are saturated, fall back to share.js for the
+// faction-rep multiplier instead of leaving the server idle.
+function deployToPservs(ns) {
+  const SHARE = "share.js";
+  let deployed = 0;
+  let shared   = 0;
+  let owned;
+  try { owned = ns.cloud.getServerNames(); } catch (_) { return { deployed, shared }; }
+  if (!owned.length) return { deployed, shared };
+
+  ensureShareWorkerExists(ns, SHARE);
+
+  for (const host of owned) {
+    if (deployHackScripts(ns, host)) { deployed++; continue; }
+
+    // No hack target chose this server (e.g. early game, or fully
+    // saturated). Fall back to share() for the rep multiplier.
+    let free = 0;
+    try { free = ns.getServerMaxRam(host) - ns.getServerUsedRam(host); }
+    catch (_) { continue; }
+    let shareCost = 4;
+    try { shareCost = ns.getScriptRam(SHARE, "home") || 4; }
+    catch (_) {}
+    if (free < shareCost) continue;
+
+    // If there are already worker scripts running on this server,
+    // don't overwrite — let them work.
+    const ps = ns.ps(host);
+    const hasWorkers = ps.some(p =>
+      p.filename === "hack.js" || p.filename === "grow.js" || p.filename === "weaken.js"
+    );
+    if (hasWorkers) continue;
+
+    // If share is already running, leave it.
+    if (ps.some(p => p.filename === SHARE)) continue;
+
+    try { ns.scp(SHARE, host, "home"); } catch (_) { continue; }
+    const threads = Math.floor(free / shareCost);
+    if (threads < 1) continue;
+    if (ns.exec(SHARE, host, threads) > 0) {
+      shared++;
+      ns.print("SUCCESS  share() on " + host + " x" + threads);
+    }
+  }
+  return { deployed, shared };
+}
+
+async function ensureShareWorkerExists(ns, filename) {
+  if (ns.fileExists(filename, "home")) return;
+  // Tiny embedded fallback in case share.js wasn't synced from disk.
+  const code = [
+    "/** @param {NS} ns */",
+    "export async function main(ns) { while (true) await ns.share(); }",
+  ].join("\n");
+  ns.write(filename, code, "w");
 }
 
 function deployHackScripts(ns, hostname) {

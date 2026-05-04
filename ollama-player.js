@@ -696,18 +696,23 @@ const PROGRAMS = [
 ];
 
 function getValidServerUpgrades(ns, money, safety) {
-  const owned = ns.cloud.getServerNames();
+  let owned;
+  try { owned = ns.cloud.getServerNames(); }
+  catch (_) { return []; }
   const maxRam = ns.cloud.getRamLimit();
 
   return owned
     .map((server) => {
-      const current = ns.getServerMaxRam(server);
-      const nextRam = Math.min(current * 2, maxRam);
-      const cost = nextRam > current ? ns.cloud.getServerUpgradeCost(server, nextRam) : Infinity;
-
-      return { server, current, nextRam, cost };
+      try {
+        const current = ns.getServerMaxRam(server);
+        const nextRam = Math.min(current * 2, maxRam);
+        const cost = nextRam > current ? ns.cloud.getServerUpgradeCost(server, nextRam) : Infinity;
+        return { server, current, nextRam, cost };
+      } catch (_) {
+        return null;
+      }
     })
-    .filter((x) => x.nextRam > x.current)
+    .filter((x) => x && x.nextRam > x.current)
     .filter((x) => x.cost > 0 && x.cost !== Infinity)
     .filter((x) => money - x.cost >= safety.minCashReserve)
     .sort((a, b) => a.cost - b.cost)
@@ -715,13 +720,26 @@ function getValidServerUpgrades(ns, money, safety) {
 }
 
 function getValidUpgradeForServer(ns, server) {
-  const maxRam = ns.cloud.getRamLimit();
-  const current = ns.getServerMaxRam(server);
-  const nextRam = Math.min(current * 2, maxRam);
+  // The model can hallucinate purchased-server names (e.g. propose
+  // pserv-19 when only pserv-0..N exist). getServerMaxRam throws
+  // hard on a bad host, which used to take the entire cycle down.
+  // Verify the server is in the cloud-owned set first.
+  if (!server) return null;
+  let owned;
+  try { owned = ns.cloud.getServerNames(); }
+  catch (_) { return null; }
+  if (!owned.includes(server)) return null;
 
+  const maxRam  = ns.cloud.getRamLimit();
+  let current;
+  try { current = ns.getServerMaxRam(server); }
+  catch (_) { return null; }
+  const nextRam = Math.min(current * 2, maxRam);
   if (nextRam <= current) return null;
 
-  const cost = ns.cloud.getServerUpgradeCost(server, nextRam);
+  let cost;
+  try { cost = ns.cloud.getServerUpgradeCost(server, nextRam); }
+  catch (_) { return null; }
   if (cost < 0 || cost === Infinity) return null;
 
   return { server, current, nextRam, cost };
