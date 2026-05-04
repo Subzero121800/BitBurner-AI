@@ -17,6 +17,22 @@ const FLAGS = {
   // Hot-reload watchdog (paired with the local scb-watch daemon)
   watchdog:          true,
 
+  // RAM budget on home for everything we spawn (companions, AI
+  // player, auto-generated workers). 0 = unlimited / use whatever
+  // is free. scb.js itself is exempt — without it nothing can
+  // launch. Workers deployed to PURCHASED servers (hack/grow/
+  // weaken on pservs) don't count against this cap; only home
+  // RAM does. This exists so people with smaller home setups can
+  // run the orchestrator + a couple of companions without trying
+  // to launch a $66 GB stack on a $32 GB home.
+  //
+  // Suggested values:
+  //   0     unlimited (current behaviour)
+  //   16    fresh save / pre-augmentation runs (orchestrator + watchdog)
+  //   48    add the AI player (deepseek-coder-v2:16b)
+  //   96    add gang-manager + bladeburner-manager
+  maxInGameRamGB:    0,
+
   // Autonomous AI player (Ollama backend — local or LAN endpoint)
   ollamaPlayer:      true,
 
@@ -178,12 +194,20 @@ export async function main(ns) {
   // having its own hardcoded copy.
   function writeEconomy() {
     try {
+      const cap     = Number(FLAGS.maxInGameRamGB) || 0;
+      const usedGB  = currentManagedRam(ns);
+      const homeMax = ns.getServerMaxRam("home");
       ns.write("/Temp/economy.json", JSON.stringify({
         ts: Date.now(),
         minCashReserve:    SAFETY.minCashReserve,
         savingsTarget:     SAFETY.savingsTarget,
         cashSpendCapPct:   SAFETY.cashSpendCapPct,
-        savingsThreshold:  SAFETY.minCashReserve + SAFETY.savingsTarget
+        savingsThreshold:  SAFETY.minCashReserve + SAFETY.savingsTarget,
+        // RAM budget snapshot for AI player + other helpers.
+        maxInGameRamGB:    cap,
+        homeMaxRamGB:      homeMax,
+        managedRamGB:      Number(usedGB.toFixed(2)),
+        budgetRemainingGB: cap > 0 ? Number(Math.max(0, cap - usedGB).toFixed(2)) : null
       }, null, 2), "w");
     } catch (_) {}
   }
@@ -800,6 +824,14 @@ function ensureRunning(ns, file, threads = 1, ...args) {
     return false;
   }
 
+  if (!withinRamBudget(ns, file, threads)) {
+    const cost = safeScriptRam(ns, file) * threads;
+    ns.print("WARN  skipping " + file + " — would exceed maxInGameRamGB=" +
+      FLAGS.maxInGameRamGB + " (cost " + cost.toFixed(1) + " GB, used " +
+      currentManagedRam(ns).toFixed(1) + " GB)");
+    return false;
+  }
+
   const pid = ns.exec(file, "home", threads, ...args);
 
   if (pid > 0) {
@@ -809,6 +841,31 @@ function ensureRunning(ns, file, threads = 1, ...args) {
 
   ns.print("ERROR  Failed to start " + file + " RAM?");
   return false;
+}
+
+// ─── RAM budget ─────────────────────────────────────────────────────
+// "Managed" RAM = everything currently running on home that we spawn,
+// excluding scb.js itself. The budget cap applies to this set.
+function safeScriptRam(ns, file) {
+  try { return ns.getScriptRam(file, "home") || 0; }
+  catch (_) { return 0; }
+}
+
+function currentManagedRam(ns) {
+  const self = ns.getScriptName();
+  let total = 0;
+  for (const proc of ns.ps("home")) {
+    if (proc.filename === self) continue;
+    total += safeScriptRam(ns, proc.filename) * proc.threads;
+  }
+  return total;
+}
+
+function withinRamBudget(ns, file, threads) {
+  const cap = Number(FLAGS.maxInGameRamGB) || 0;
+  if (cap <= 0) return true; // unlimited
+  const cost = safeScriptRam(ns, file) * Math.max(1, threads);
+  return currentManagedRam(ns) + cost <= cap;
 }
 
 function ensureStopped(ns, file) {

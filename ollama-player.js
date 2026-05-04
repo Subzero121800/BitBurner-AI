@@ -154,6 +154,11 @@ function buildGameState(ns, safety) {
     // and stops updating when the WS to the game drops.
     systemHealth: getSystemHealth(ns),
 
+    // RAM budget — read from /Temp/economy.json (scb.js owns the
+    // policy). When budgetRemainingGB drops to ~0 the AI should
+    // avoid actions that spawn more home-side scripts.
+    budget: getBudget(ns),
+
     serverFleet: {
       ownedCount: purchased.length,
       limit: serverLimit,
@@ -302,6 +307,13 @@ function buildPrompt(state, safety) {
     "- state.systemHealth.syncStale: when true the host can no longer deliver fresh code into the game (the heartbeat file has gone stale). The state you're seeing may be hours old.",
     "- When syncStale is true, your ENTIRE response must be exactly: [{\"action\":\"reconnect_remote_api\"}] — nothing else. Don't deploy, don't buy, don't propose patches. The reconnect action calls the in-game DOM to click Options→Remote API→Connect. After it succeeds, normal cycles resume.",
     "- When syncStale is false, ignore reconnect_remote_api entirely.",
+    "",
+    "RAM budget (only relevant if state.budget.capped is true):",
+    "- state.budget.maxInGameRamGB is the user's cap on home-side scripts.",
+    "- state.budget.managedRamGB is what's currently used by spawned scripts (excludes scb.js itself).",
+    "- state.budget.budgetRemainingGB is the headroom left.",
+    "- If state.budget.tight is true, do NOT propose write_generated_script + run_script that would launch a new home-side worker. Pick income actions that use existing capacity (deploy_hack to pserv-N, work_company, commit_crime, etc.).",
+    "- If state.budget.capped is false (unlimited), ignore this section.",
     "",
     "Filesystem rules:",
     "- write_generated_script and delete_generated_script only work under /ai/generated/, /ai/scratch/, /Temp/, /logs/. Anywhere else is rejected.",
@@ -752,6 +764,21 @@ function resolveOllamaHost(ns, fallback) {
   } catch (_) {
     return fallback;
   }
+}
+
+function getBudget(ns) {
+  try {
+    if (!ns.fileExists("/Temp/economy.json", "home")) return null;
+    const econ = JSON.parse(ns.read("/Temp/economy.json")) || {};
+    return {
+      maxInGameRamGB:    econ.maxInGameRamGB || 0,
+      managedRamGB:      econ.managedRamGB || 0,
+      budgetRemainingGB: econ.budgetRemainingGB,         // null if unlimited
+      capped:            (econ.maxInGameRamGB || 0) > 0,
+      tight:             (econ.maxInGameRamGB || 0) > 0 &&
+                         (econ.budgetRemainingGB ?? Infinity) < 4
+    };
+  } catch (_) { return null; }
 }
 
 function getSystemHealth(ns) {
