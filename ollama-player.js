@@ -38,6 +38,7 @@ export async function main(ns) {
   ns.print("INFO  Ollama Player v8 — backend: " + config.backend);
   ns.print("INFO  ollamaHost: " + config.ollamaHost);
   ns.print("INFO  poll: " + config.pollInterval + "ms | maxActions: " + safety.maxActionsPerCycle);
+  appendLog(ns, safety, `START backend=${config.backend} host=${config.ollamaHost} model=${config.ollamaModel}`);
 
   while (true) {
     try {
@@ -46,10 +47,20 @@ export async function main(ns) {
       config.ollamaHost = resolveOllamaHost(ns, config.ollamaHost);
 
       const state = buildGameState(ns, safety);
+
+      // Self-context: feed the last ~30 entries of our own action log
+      // back into the prompt so the model can see what it just did and
+      // avoid the "try the same forbidden upgrade 50 times in a row"
+      // failure mode.
+      const recent = readRecentLog(ns, 30);
+      state.recentActions = recent;
+      state.jammedActions = recentlyJammedActions(recent);
+
       const prompt = buildPrompt(state, safety);
       const actions = await askAI(ns, config, prompt);
 
       ns.print("INFO  AI returned " + actions.length + " action(s)");
+      appendLog(ns, safety, `CYCLE money=${state.player.moneyFormatted} actions=${actions.length}`);
 
       let executed = 0;
 
@@ -62,28 +73,28 @@ export async function main(ns) {
         const safe = safetyCheck(ns, repaired, state, safety);
         if (!safe.ok) {
           ns.print("SKIP  " + JSON.stringify(repaired) + " => " + safe.reason);
+          appendLog(ns, safety, `SKIP  ${JSON.stringify(repaired)} => ${safe.reason}`);
           continue;
         }
 
         const valid = validateAction(repaired);
         if (!valid.ok) {
           ns.print("FAIL  " + JSON.stringify(repaired) + " => " + valid.reason);
+          appendLog(ns, safety, `FAIL  ${JSON.stringify(repaired)} => ${valid.reason}`);
           continue;
         }
 
         const result = await executeAction(ns, repaired);
 
-        ns.print(
-          (result.success ? "OK    " : "FAIL  ") +
-          JSON.stringify(repaired) +
-          " => " +
-          result.result
-        );
+        const tag = result.success ? "OK    " : "FAIL  ";
+        ns.print(tag + JSON.stringify(repaired) + " => " + result.result);
+        appendLog(ns, safety, `${tag.trim()}  ${JSON.stringify(repaired)} => ${result.result}`);
 
         executed++;
       }
     } catch (err) {
       ns.print("ERROR  AI cycle failed: " + String(err));
+      appendLog(ns, safety, `ERROR  cycle threw: ${String(err)}`);
     }
 
     await ns.sleep(config.pollInterval || 60_000);
@@ -250,6 +261,14 @@ function buildPrompt(state, safety) {
     "- Do not deploy workers when total free RAM is too low.",
     "- If RAM is full, upgrade servers, wait, or noop.",
     "- Prefer safe, incremental progress.",
+    "",
+    "Self-correction rules (READ THIS FIRST):",
+    "- state.recentActions contains your own log of recently-attempted actions.",
+    "- state.jammedActions lists (action, reason) pairs you've tried 3+ times in a row that all failed. NEVER propose any of those actions again this cycle.",
+    "- If you see in state.jammedActions that upgrade_server is failing for cash reserve reasons, you cannot afford it — switch to deploy_hack, commit_crime, work_company, install_augmentations, or any income-generating action instead. Try again only after money grows.",
+    "- If you see the same action succeed and you'd repeat it, only do so if the context has actually changed (e.g. a new server became available).",
+    "- If you see a pattern in your log that looks like a code-level bug (the orchestrator or action library doing the wrong thing repeatedly), use read_file to inspect /ollama-actions.js or /ollama-player.js, then emit a propose_patch action so a human can review the fix. Do not write_generated_script in place of fixing core code; protected files require propose_patch.",
+    "- You can also write helpful one-off helper scripts under /ai/generated/ via write_generated_script and run them via run_script if a specific automation would unblock you.",
     "",
     "Filesystem rules:",
     "- write_generated_script and delete_generated_script only work under /ai/generated/, /ai/scratch/, /Temp/, /logs/. Anywhere else is rejected.",
@@ -419,6 +438,24 @@ function safetyCheck(ns, action, state, safety) {
 
   if (safety.blockedActions && safety.blockedActions.includes(action.action)) {
     return { ok: false, reason: "blocked action: " + action.action };
+  }
+
+  // Server-side jam suppression: even if the AI ignores the prompt
+  // rules, we won't let it spam the same failing action 50× in a row.
+  // state.jammedActions was computed from the recent log earlier this
+  // cycle. If the proposed action matches a jammed signature, reject
+  // with a clear "REPEAT-SUPPRESSED" reason that goes back into the
+  // log and shows up in the next cycle's recentActions for the AI.
+  if (Array.isArray(state.jammedActions) && state.jammedActions.length) {
+    const sig = JSON.stringify(action);
+    for (const j of state.jammedActions) {
+      // j.sig is `{...action json...} :: <reason>` — match on the
+      // action JSON prefix only, since the reason changes by run.
+      const actionPart = j.sig.split(" :: ")[0];
+      if (actionPart === sig) {
+        return { ok: false, reason: "REPEAT-SUPPRESSED (" + j.count + "x): identical action just failed — try a different approach" };
+      }
+    }
   }
 
   if (action.action === "buy_program") {
@@ -678,4 +715,57 @@ async function fetchWithTimeout(url, options, timeoutMs) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// ─── persistent action log ──────────────────────────────────────────
+const PLAYER_LOG = "/logs/ollama-player.log";
+const PLAYER_LOG_PREV = "/logs/ollama-player.log.1";
+const PLAYER_LOG_MAX_BYTES = 256_000;
+
+function appendLog(ns, safety, line) {
+  if (!safety.logAllActions) return;
+  try {
+    const ts = new Date().toISOString();
+    const entry = ts + " " + String(line).replace(/\s+$/, "") + "\n";
+    let cur = ns.fileExists(PLAYER_LOG, "home") ? ns.read(PLAYER_LOG) : "";
+    if (cur.length + entry.length > PLAYER_LOG_MAX_BYTES) {
+      // Rotate to avoid pathological growth (and slow ns.read each cycle).
+      ns.write(PLAYER_LOG_PREV, cur, "w");
+      cur = "";
+    }
+    ns.write(PLAYER_LOG, cur + entry, "w");
+  } catch (_) { /* swallow — logging must never crash the loop */ }
+}
+
+// Last N log entries — fed back into the prompt as `recentActions` so
+// the model can see what it just did and avoid pathological loops.
+function readRecentLog(ns, n) {
+  try {
+    if (!ns.fileExists(PLAYER_LOG, "home")) return [];
+    const raw = ns.read(PLAYER_LOG);
+    const lines = raw.split("\n").filter(Boolean);
+    return lines.slice(-n);
+  } catch (_) { return []; }
+}
+
+// Look at the last K outcomes and report any (action, reason) pair
+// that has been rejected ≥ threshold times in a row. The system prompt
+// tells the AI to stop proposing actions in this set.
+function recentlyJammedActions(recent, { window = 30, threshold = 3 } = {}) {
+  const tail = recent.slice(-window);
+  const counts = new Map();
+  for (const line of tail) {
+    // Lines look like:
+    //   2026-05-04T... SKIP  {"action":"upgrade_server",...} => upgrade_server would violate cash reserve
+    //   2026-05-04T... OK    {"action":"deploy_hack",...} => deployed alpha-ent on ai-pserv-0 W:9362 ...
+    const m = line.match(/\b(SKIP|FAIL)\s+(\{[^}]+\})\s+=>\s+(.+)$/);
+    if (!m) continue;
+    const sig = m[2] + " :: " + m[3];
+    counts.set(sig, (counts.get(sig) || 0) + 1);
+  }
+  const jammed = [];
+  for (const [sig, n] of counts) {
+    if (n >= threshold) jammed.push({ sig, count: n });
+  }
+  return jammed;
 }

@@ -148,6 +148,12 @@ export async function main(ns) {
     let deployed = 0;
     const backdoorQueue = [];
 
+    // Aggregate "needs higher hack" / "needs more ports" servers into
+    // single summary lines instead of one WARN per skipped host. The
+    // tail used to fill with 40 identical-looking messages every cycle.
+    const needHack  = [];
+    const needPorts = [];
+
     if (FLAGS.scanAndRoot) {
       for (const hostname of allServers) {
         if (hostname === "home") continue;
@@ -163,13 +169,13 @@ export async function main(ns) {
 
         if (server.requiredHackingSkill > hackLvl) {
           skipped++;
-          ns.print("WARN  " + pad(hostname, 24) + " needs hack " + server.requiredHackingSkill + " you: " + hackLvl);
+          needHack.push(hostname + "(" + server.requiredHackingSkill + ")");
           continue;
         }
 
         if (server.numOpenPortsRequired > portCrax.length) {
           skipped++;
-          ns.print("WARN  " + pad(hostname, 24) + " needs " + server.numOpenPortsRequired + " ports you: " + portCrax.length);
+          needPorts.push(hostname + "(" + server.numOpenPortsRequired + ")");
           continue;
         }
 
@@ -220,13 +226,40 @@ export async function main(ns) {
       }
     }
 
+    if (needHack.length > 0) {
+      ns.print("WARN  Skipped (need hack > " + hackLvl + "): " + needHack.length + " — " + needHack.slice(0, 5).join(", ") + (needHack.length > 5 ? ", +" + (needHack.length - 5) + " more" : ""));
+    }
+    if (needPorts.length > 0) {
+      ns.print("WARN  Skipped (need more ports than " + portCrax.length + "): " + needPorts.length + " — " + needPorts.slice(0, 5).join(", ") + (needPorts.length > 5 ? ", +" + (needPorts.length - 5) + " more" : ""));
+    }
+
     ns.print("");
     ns.print("INFO  Rooted: " + rooted + " | Backdoor: " + backdoored + " | Deployed: " + deployed + " | Skipped: " + skipped);
     ns.print("INFO  Sleeping " + CYCLE_MS / 1000 + "s until next scan");
     ns.print("");
 
+    appendScbLog(ns, "CYCLE hack=" + hackLvl + " crackers=" + portCrax.length + "/5 servers=" + allServers.length + " rooted=" + rooted + " backdoor=" + backdoored + " deployed=" + deployed + " skipped=" + skipped);
+
     await ns.sleep(CYCLE_MS);
   }
+}
+
+// ─── persistent cycle log ──────────────────────────────────────────
+const SCB_LOG = "/logs/scb.log";
+const SCB_LOG_PREV = "/logs/scb.log.1";
+const SCB_LOG_MAX_BYTES = 256_000;
+
+function appendScbLog(ns, line) {
+  try {
+    const ts = new Date().toISOString();
+    const entry = ts + " " + String(line).replace(/\s+$/, "") + "\n";
+    let cur = ns.fileExists(SCB_LOG, "home") ? ns.read(SCB_LOG) : "";
+    if (cur.length + entry.length > SCB_LOG_MAX_BYTES) {
+      ns.write(SCB_LOG_PREV, cur, "w");
+      cur = "";
+    }
+    ns.write(SCB_LOG, cur + entry, "w");
+  } catch (_) {}
 }
 
 function warnOnConflicts(ns) {
@@ -444,7 +477,7 @@ async function ensureWatchdogExists(ns, filename) {
 function ensurePlayerScripts(ns) {
   const need = [
     { file: "/ollama-actions.js", marker: "ACTIONS_VERSION_4" },
-    { file: "/ollama-player.js", marker: "PLAYER_VERSION_5" }
+    { file: "/ollama-player.js",  marker: "PLAYER_VERSION_8"  }
   ];
 
   let ok = true;

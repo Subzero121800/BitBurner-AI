@@ -1,6 +1,6 @@
 /** @param {NS} ns */
 export async function main(ns) {
-  // WATCHDOG_VERSION_2
+  // WATCHDOG_VERSION_3
   ns.disableLog("ALL");
   try { ns.ui?.openTail?.(); } catch (_) {}
 
@@ -12,16 +12,26 @@ export async function main(ns) {
   // Emit an "alive" line every N polls so the tail isn't blank when
   // nothing has changed — confirms the watchdog is actually running.
   const ALIVE_EVERY    = 30;
+  // Log-flush every M polls (M=15 ⇒ every 30 s). POSTs new
+  // /logs/<name>.log content to the local sink and truncates the
+  // in-game file on success so the next flush only sends new data.
+  const FLUSH_EVERY    = 15;
+  const SINK_BASE      = "http://127.0.0.1:9999/sink/";
+  const LOG_TARGETS    = [
+    { file: "/logs/scb.log",           name: "scb" },
+    { file: "/logs/ollama-player.log", name: "ollama-player" },
+  ];
 
   let lastMarker = readFileSafe(RESTART_FILE);
   let prevState  = null;
   let cycle      = 0;
 
   ns.tprint("INFO  scb-watchdog up — polling " + RESTART_FILE);
-  ns.print("INFO  scb-watchdog v2 up");
+  ns.print("INFO  scb-watchdog v3 up");
   ns.print("INFO  poll=" + POLL_MS + "ms stale=" + STALE_MS + "ms target=" + TARGET);
   ns.print("INFO  watching " + RESTART_FILE);
   ns.print("INFO  watching " + HEARTBEAT_FILE);
+  ns.print("INFO  flushing logs every " + (FLUSH_EVERY * POLL_MS / 1000) + "s to " + SINK_BASE);
 
   while (true) {
     cycle++;
@@ -69,7 +79,47 @@ export async function main(ns) {
       ns.print("INFO  alive cycle=" + cycle + " state=" + state + " hb_age=" + ageS);
     }
 
+    // ── 4. log flush — push in-game logs to local sink ──────────────
+    if (cycle % FLUSH_EVERY === 0) {
+      for (const t of LOG_TARGETS) await flushLog(t.file, t.name);
+    }
+
     await ns.sleep(POLL_MS);
+  }
+
+  async function flushLog(gameFile, name) {
+    try {
+      if (!ns.fileExists(gameFile, "home")) return;
+      const content = ns.read(gameFile);
+      if (!content) return;
+      const url = SINK_BASE + name;
+      const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+      const tid  = ctrl ? setTimeout(() => ctrl.abort(), 3000) : null;
+      try {
+        const res = await fetch(url, {
+          method:  "POST",
+          headers: { "Content-Type": "text/plain" },
+          body:    content,
+          signal:  ctrl ? ctrl.signal : undefined,
+        });
+        if (tid) clearTimeout(tid);
+        if (!res || !res.ok) return; // sink down — try again next cycle
+        // Single-threaded JS: between read and write nothing else can
+        // touch the file. Re-read in case the writer appended during
+        // the await — preserve any new content.
+        const fresh = ns.read(gameFile);
+        if (fresh.length > content.length) {
+          ns.write(gameFile, fresh.slice(content.length), "w");
+        } else {
+          ns.write(gameFile, "", "w");
+        }
+      } catch (_) {
+        if (tid) clearTimeout(tid);
+        // network error — leave file alone, retry next flush
+      }
+    } catch (e) {
+      ns.print("WARN  flushLog(" + name + ") threw: " + String(e.message || e));
+    }
   }
 
   function readFileSafe(p) {

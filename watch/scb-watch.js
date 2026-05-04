@@ -75,6 +75,9 @@ const DEBOUNCE_MS    = 500;
 const HEARTBEAT_MS   = 2000;
 const STATUS_MS      = 5000;
 const BRIDGE_PORT    = Number(process.env.PORT || 3000);
+const SINK_PORT      = Number(process.env.SCB_SINK_PORT || 9999);
+const SINK_NAMES     = new Set(["scb", "ollama-player"]);
+const SINK_MAX_BYTES = 1_000_000;
 const SYNC_TAIL_BYTES = 4096; // how much of sync.log to look at for state
 
 fs.mkdirSync(RUN_DIR,  { recursive: true });
@@ -248,6 +251,45 @@ async function detectOllamaHost() {
 // Initial probe + periodic re-probe.
 detectOllamaHost();
 setInterval(detectOllamaHost, OLLAMA_PROBE_MS);
+
+// ─── log sink ───────────────────────────────────────────────────────
+// In-game scripts POST log content to http://127.0.0.1:9999/sink/{name}
+// and we append the body to .run/game-{name}.log so the host has a
+// durable, tail-able copy. Bound to localhost only — no LAN exposure.
+const sinkServer = http.createServer((req, res) => {
+  if (req.method !== "POST" || !req.url.startsWith("/sink/")) {
+    res.writeHead(404); res.end("not found"); return;
+  }
+  const name = req.url.slice("/sink/".length).replace(/[^a-z0-9_-]/gi, "");
+  if (!SINK_NAMES.has(name)) {
+    res.writeHead(403); res.end("unknown sink: " + name); return;
+  }
+  let total = 0;
+  const chunks = [];
+  req.on("data", (c) => {
+    total += c.length;
+    if (total > SINK_MAX_BYTES) { req.destroy(); return; }
+    chunks.push(c);
+  });
+  req.on("end", () => {
+    if (total > SINK_MAX_BYTES) {
+      res.writeHead(413); res.end("too large"); return;
+    }
+    const body = Buffer.concat(chunks).toString("utf8");
+    if (!body) { res.writeHead(204); res.end(); return; }
+    try {
+      fs.appendFileSync(path.join(RUN_DIR, "game-" + name + ".log"), body);
+      res.writeHead(200); res.end("ok " + body.length);
+    } catch (e) {
+      logLine("sink write failed (" + name + "): " + e.message);
+      res.writeHead(500); res.end(e.message);
+    }
+  });
+  req.on("error", () => { try { res.writeHead(400); res.end(); } catch (_) {} });
+});
+sinkServer.listen(SINK_PORT, "127.0.0.1", () => {
+  logLine("sink listening on 127.0.0.1:" + SINK_PORT + " (" + Array.from(SINK_NAMES).join(", ") + ")");
+});
 
 // ─── status snapshot ─────────────────────────────────────────────────
 function readSyncTail() {

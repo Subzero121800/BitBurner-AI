@@ -157,6 +157,30 @@ Configured in `SAFETY` in [`scb.js`](scb.js):
 
 **Kill switch**: write any content to `/Temp/ollama-player-stop.txt` — the player exits cleanly on its next cycle.
 
+### Persistent logs
+
+The orchestrator and player both append a structured line to disk for every cycle / action:
+
+| In-game file              | Source                  | Contents                                                          |
+|---------------------------|-------------------------|-------------------------------------------------------------------|
+| `/logs/scb.log`           | `scb.js`                | `CYCLE hack=… crackers=… rooted=… backdoor=… deployed=… skipped=…` |
+| `/logs/ollama-player.log` | `ollama-player.js`      | `OK`/`SKIP`/`FAIL` per action with the JSON proposal + result     |
+
+Both rotate at ~256 KB to keep `ns.read` cheap. Every 30 s the in-game watchdog POSTs new content to the local sink (`http://127.0.0.1:9999/sink/<name>`) and truncates the in-game file on success — so you also get tail‑able copies on the host:
+
+```sh
+tail -f .run/game-scb.log              # orchestrator cycle history
+tail -f .run/game-ollama-player.log    # AI action stream
+```
+
+Ad-hoc pulls of any in-game file still work via the terminal: `download /logs/scb.log`.
+
+### Self-context (player feeds its own log into the prompt)
+
+`buildGameState` reads the last 30 lines of `/logs/ollama-player.log` and includes them as `state.recentActions`. It also pre-computes `state.jammedActions` — `(action, reason)` pairs that have failed 3+ times in a row — and the system prompt explicitly tells the model to abandon those. The `safetyCheck` validator enforces it server-side too: if a proposed action matches a jammed signature it gets rejected with `REPEAT-SUPPRESSED (Nx): identical action just failed — try a different approach`.
+
+The model can also call `read_file` on its own log mid-cycle to look further back, and emit `propose_patch` if it spots a code-level bug in the orchestrator or action library — the human-in-loop reviewer (`approve-patch.js`) gates those.
+
 ---
 
 ## AI filesystem access (guard-railed)

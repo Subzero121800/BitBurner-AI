@@ -216,6 +216,8 @@ case "${1:-start}" in
       ! -path "./Temp/*" \
       ! -path "./.git/*" \
       ! -path "./Deprecated/*" \
+      ! -path "./_archive/*" \
+      ! -path "./docs/*" \
       -print -exec touch {} + | wc -l | tr -d ' ')
     c_green "touched $count files — watch sync.log for pushes"
     sleep 2
