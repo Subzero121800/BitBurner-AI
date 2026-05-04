@@ -107,7 +107,15 @@ async function tick(ns, lastCount) {
   }
 
   const directives = readDirectives(ns);
-  const snapshot   = { ts: Date.now(), count: n, sleeves: [] };
+  // `version` field doubles as a freshness marker — scb.js kills
+  // and respawns this manager if the disk file's marker doesn't
+  // match.
+  const snapshot   = {
+    ts: Date.now(),
+    version: "SLEEVE_MANAGER_VERSION_3",
+    count: n,
+    sleeves: []
+  };
 
   for (let i = 0; i < n; i++) {
     let info;

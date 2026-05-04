@@ -457,8 +457,56 @@ function launchCompanions(ns) {
       continue;
     }
 
+    // Auto-bounce stale versions: if the disk file has a newer
+    // *_VERSION_* marker than what the running instance published
+    // to /Temp/<name>-state.json, kill the running instance so
+    // ensureRunning will re-spawn the new version.
+    ensureCompanionFresh(ns, file);
+
     const args = COMPANION_ARGS[file] || [];
     ensureRunning(ns, file, 1, ...args);
+  }
+}
+
+// Compare the marker in the on-disk file with the `version` field
+// the running manager last wrote to its /Temp/<name>-state.json
+// snapshot. Kill the running instance on mismatch — ensureRunning
+// will then start the new version on the same launchCompanions pass.
+// No-op if the file has no recognisable marker, or no state has
+// been published yet (manager hasn't ticked once).
+function ensureCompanionFresh(ns, file) {
+  const baseName = file.replace(/^\//, "").replace(/\.js$/, "");
+  const stateFile = "/Temp/" + baseName + "-state.json";
+
+  let diskMarker = null;
+  try {
+    const content = ns.read(file);
+    const m = content.match(/[A-Z][A-Z_]*VERSION_\d+/);
+    if (m) diskMarker = m[0];
+  } catch (_) {}
+  if (!diskMarker) return;
+
+  let runningMarker = null;
+  try {
+    if (ns.fileExists(stateFile, "home")) {
+      const st = JSON.parse(ns.read(stateFile)) || {};
+      if (st.version) runningMarker = st.version;
+    }
+  } catch (_) {}
+
+  if (!runningMarker) return;             // no record yet — leave alone
+  if (runningMarker === diskMarker) return; // up-to-date
+
+  // Stale — kill so ensureRunning will respawn the new version.
+  let killed = 0;
+  for (const p of ns.ps("home")) {
+    if (p.filename === file || p.filename === "/" + file) {
+      if (ns.kill(p.pid)) killed++;
+    }
+  }
+  if (killed) {
+    ns.print("INFO  bounced " + file + " (" + runningMarker + " → " + diskMarker + ")");
+    appendScbLog(ns, "BOUNCE " + file + " " + runningMarker + " -> " + diskMarker);
   }
 }
 

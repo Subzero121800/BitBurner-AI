@@ -253,8 +253,13 @@ async function tick(ns) {
   } catch (_) { /* warfare API can throw early-game */ }
 
   // 7) publish per-cycle state for the AI player.
+  // The `version` field doubles as a freshness marker for scb.js's
+  // companion launcher — if the disk file's marker doesn't match
+  // this, scb.js kills the running instance so the new version
+  // gets re-spawned.
   const snapshot = {
     ts:                Date.now(),
+    version:           "GANG_MANAGER_VERSION_2",
     inGang:            true,
     faction:           info.faction,
     members:           members.length,

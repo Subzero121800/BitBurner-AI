@@ -157,10 +157,13 @@ async function tick(ns) {
     appendLog(ns, "FAIL  startAction " + choice.type + " / " + choice.name);
   }
 
-  // Publish per-cycle state for the AI player.
+  // Publish per-cycle state for the AI player. The `version` field
+  // doubles as a freshness marker for scb.js — disk-file marker must
+  // match this, else scb.js kills+respawns the manager.
   try {
     ns.write(STATE_FILE, JSON.stringify({
       ts:        Date.now(),
+      version:   "BLADEBURNER_MANAGER_VERSION_1",
       inBB:      true,
       rank:      safe(() => ns.bladeburner.getRank()) || 0,
       skillPts:  safe(() => ns.bladeburner.getSkillPoints()) || 0,
