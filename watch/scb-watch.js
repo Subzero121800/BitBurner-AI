@@ -304,18 +304,39 @@ function readSyncTail() {
   } catch (_) { return ""; }
 }
 
+// Persistent connection state.
+// `bitburner-filesync` logs `Connection made!` on connect and
+// `Connection closed.` / `disconnect` on drop, but ALSO logs every
+// "X changed" line whenever a watched file's mtime updates (which
+// includes our 2-second heartbeat). Within a minute that fills the
+// tail buffer and the original connect event scrolls out — leaving
+// us unable to distinguish "connected, still working" from "we never
+// saw an event." The fix is to remember what we've already seen
+// across status ticks rather than re-deriving from the tail each time.
+let _connState = { kind: "unknown", at: 0 };
+
 function syncConnectionState() {
   const tail = readSyncTail();
-  // The library prints `Connection made!` on connect and
-  // `Connection closed.` (or `disconnect`) on drop. Compare last
-  // occurrences of each to decide current state.
   const lastConnect    = tail.lastIndexOf("Connection made");
   const lastDisconnect = Math.max(
     tail.lastIndexOf("Connection closed"),
     tail.lastIndexOf("disconnect"),
   );
-  if (lastConnect < 0 && lastDisconnect < 0) return "no-events";
-  return lastConnect > lastDisconnect ? "connected" : "disconnected";
+
+  if (lastConnect >= 0 && lastConnect > lastDisconnect) {
+    if (_connState.kind !== "connected") {
+      _connState = { kind: "connected", at: Date.now() };
+      logLine("filesync connect event observed");
+    }
+  } else if (lastDisconnect >= 0 && lastDisconnect > lastConnect) {
+    if (_connState.kind !== "disconnected") {
+      _connState = { kind: "disconnected", at: Date.now() };
+      logLine("filesync DISCONNECT event observed");
+    }
+  }
+  // No event visible in this tail snapshot? Keep the last known
+  // state — connected stays connected until we see a closed event.
+  return _connState.kind;
 }
 
 function probeBridge() {
@@ -362,16 +383,16 @@ setInterval(async () => {
     lastStatus = line;
   }
 
-  // Track sustained disconnect and fire a macOS notification when
-  // it crosses 60 s — the user wanted a permanent fix, this is the
-  // host-side half of it. (In-game half is the watchdog DOM walker
-  // and the AI's reconnect_remote_api action.)
-  if (sync === "disconnected" || sync === "no-events") {
+  // Notify only on CONFIRMED disconnect (a Connection closed event
+  // was observed). "unknown" — the tail rolled past the connect
+  // event before we ever saw it — is silenced; assume the user
+  // knows what they're doing if they explicitly clicked Connect.
+  if (sync === "disconnected") {
     if (disconnectedSince === 0) disconnectedSince = Date.now();
     if (Date.now() - disconnectedSince > 60_000) {
       notifyMac(
         "BitBurner-AI: Remote API offline",
-        "filesync hasn't seen game traffic in 60s+. Open Bitburner → Options → Remote API → Connect (and tick Auto-connect on Start)."
+        "filesync saw a disconnect event 60s+ ago. Open Bitburner → Options → Remote API → Connect (and tick Auto-connect on Start)."
       );
     }
   } else {
