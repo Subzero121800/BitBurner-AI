@@ -86,7 +86,7 @@
   <rect class="box" x="345" y="70"  width="220" height="100"/>
   <text class="title"    x="365" y="94">/scb.js</text>
   <text class="subtitle" x="365" y="114">orchestrator · cycle 30 s</text>
-  <text class="subtitle" x="365" y="130">scan · root · backdoor · deploy</text>
+  <text class="subtitle" x="365" y="130">scan + root + deploy</text>
   <text class="subtitle" x="365" y="146">writes /Temp/economy.json</text>
   <text class="subtitle" x="365" y="162">writes /logs/scb.txt</text>
 
@@ -103,7 +103,7 @@
   <text class="title"    x="365" y="224">/scb-watchdog.js</text>
   <text class="subtitle" x="365" y="244">poll /Temp/scb-restart.txt</text>
   <text class="subtitle" x="365" y="260">→ kill scb.js + re-exec</text>
-  <text class="subtitle" x="365" y="276">DOM auto-Connect on RAPI drop</text>
+  <text class="subtitle" x="365" y="276">DOM auto-reconnect on drop</text>
   <text class="subtitle" x="365" y="292">flush /logs/* via cursor</text>
 
   <!-- /ollama-player.js -->
@@ -112,18 +112,19 @@
   <text class="subtitle" x="605" y="244">OBSERVE → DECIDE → EXECUTE</text>
   <text class="subtitle" x="605" y="260">reads /Temp/ollama-host.txt</text>
   <text class="subtitle" x="605" y="276">reads /logs/ollama-player.txt</text>
-  <text class="subtitle" x="605" y="292">→ recentActions / jammedActions</text>
-  <text class="subtitle" x="605" y="308">savings lock + repeat-suppress</text>
+  <text class="subtitle" x="605" y="292">→ recentActions, jammedActions</text>
+  <text class="subtitle" x="605" y="308">savings lock + jam suppress</text>
   <text class="subtitle" x="605" y="324">systemHealth.syncStale rule</text>
   <text class="subtitle" x="605" y="340">writes /logs/ollama-player.txt</text>
 
   <!-- /ollama-actions.js -->
-  <rect class="box-ai" x="345" y="335" width="220" height="100"/>
+  <rect class="box-ai" x="345" y="335" width="220" height="116"/>
   <text class="title"    x="365" y="359">/ollama-actions.js</text>
   <text class="subtitle" x="365" y="379">ACTION_SCHEMA · dispatcher</text>
   <text class="subtitle" x="365" y="395">guard-railed FS actions</text>
   <text class="subtitle" x="365" y="411">PROTECTED + path traversal</text>
-  <text class="subtitle" x="365" y="427">propose_patch + reconnect_remote_api</text>
+  <text class="subtitle" x="365" y="427">propose_patch ·</text>
+  <text class="subtitle" x="365" y="443">reconnect_remote_api</text>
 
   <!-- in-game state files cluster -->
   <rect class="box-alt" x="345" y="465" width="460" height="60"/>
@@ -182,7 +183,7 @@
   <text class="arrowlbl-mono" x="830" y="273" text-anchor="middle">/api/generate</text>
 
   <!-- ollama-actions / ollama-player → state files -->
-  <line class="arrow-dim" x1="455" y1="435" x2="455" y2="465"/>
+  <line class="arrow-dim" x1="455" y1="451" x2="455" y2="465"/>
   <line class="arrow-dim" x1="695" y1="360" x2="695" y2="465"/>
 
   <!-- propose_patch → /ai/patches → approve-patch -->
