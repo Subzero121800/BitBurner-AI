@@ -1,0 +1,13 @@
+{
+  "name": "scb-claude-bridge",
+  "version": "2.0.0",
+  "description": "HTTP shim that proxies Bitburner /ollama-player.js requests to the local Claude Code CLI (claude -p).",
+  "private": true,
+  "main": "claude-bridge.js",
+  "scripts": {
+    "start": "node claude-bridge.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

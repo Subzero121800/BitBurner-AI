@@ -1,0 +1,21 @@
+{
+  "search.exclude": {
+    "_archive/": true,
+    "Temp/": true,
+    "ai/generated/": true,
+    "ai/scratch/": true,
+    "ai/patches/applied-*.json": true,
+    "logs/": true,
+    ".run/": true,
+    "**/node_modules": true
+  },
+  "files.watcherExclude": {
+    "**/.run/**": true,
+    "**/_archive/**": true,
+    "**/Temp/**": true,
+    "**/node_modules/**": true
+  },
+  "files.associations": {
+    "*.script": "javascript"
+  }
+}

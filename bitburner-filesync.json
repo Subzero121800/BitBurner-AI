@@ -1,0 +1,9 @@
+{
+  "scriptsFolder": ".",
+  "port": 12525,
+  "quiet": false,
+  "allowedFiletypes": [".js", ".script", ".txt"],
+  "definitionFile": {
+    "update": false
+  }
+}

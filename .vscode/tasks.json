@@ -1,0 +1,70 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "scb: start all",
+      "type": "shell",
+      "command": "./scb.sh start",
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "panel": "dedicated", "reveal": "always", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "scb: stop all",
+      "type": "shell",
+      "command": "./scb.sh stop",
+      "presentation": { "panel": "dedicated", "reveal": "always", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "scb: restart",
+      "type": "shell",
+      "command": "./scb.sh restart",
+      "presentation": { "panel": "dedicated", "reveal": "always", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "scb: status",
+      "type": "shell",
+      "command": "./scb.sh status",
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "scb: tail logs",
+      "type": "shell",
+      "command": "./scb.sh logs",
+      "isBackground": true,
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "scb: filesync only",
+      "type": "shell",
+      "command": "./scb.sh sync",
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "scb: bridge only",
+      "type": "shell",
+      "command": "./scb.sh bridge",
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "scb: watch only",
+      "type": "shell",
+      "command": "./scb.sh watch",
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "scb: sync-all",
+      "type": "shell",
+      "command": "./scb.sh sync-all",
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    }
+  ]
+}

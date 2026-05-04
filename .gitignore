@@ -1,0 +1,34 @@
+# Local service state
+.run/
+*.log
+*.pid
+
+# Local secrets / overrides
+bridge/.env
+watch/ollama-candidates.json
+
+# Node deps (none ship by default — bridge + watch are stdlib only)
+node_modules/
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Game runtime artifacts (filesync side)
+Temp/
+
+# AI runtime: keep the structure (ai/{generated,scratch,patches}/README.txt
+# are committed) but don't track AI-authored content or applied snapshots
+ai/generated/*
+!ai/generated/README.txt
+ai/scratch/*
+!ai/scratch/.gitkeep
+ai/patches/*
+!ai/patches/README.txt
+logs/*
+!logs/.gitkeep
+
+# Pre-flight backups + zip archives
+_archive/
+*.zip
+.backup-pre-zip/
