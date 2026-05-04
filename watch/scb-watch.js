@@ -76,7 +76,7 @@ const HEARTBEAT_MS   = 2000;
 const STATUS_MS      = 5000;
 const BRIDGE_PORT    = Number(process.env.PORT || 3000);
 const SINK_PORT      = Number(process.env.SCB_SINK_PORT || 9999);
-const SINK_NAMES     = new Set(["scb", "ollama-player"]);
+const SINK_NAMES     = new Set(["scb", "ollama-player", "gang", "bladeburner"]);
 const SINK_MAX_BYTES = 1_000_000;
 const SYNC_TAIL_BYTES = 4096; // how much of sync.log to look at for state
 

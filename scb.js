@@ -38,10 +38,12 @@ const FLAGS = {
     // both at once — scb.js prints a conflict warning if you do.
     "autopilot.js":               false,
 
-    // Individual managers (active when autopilot.js is OFF)
+    // Our own managers (ship in this repo, no external deps)
+    "gang-manager.js":            true,    // gang autopilot — recruit, task, ascend, equip, warfare
+    "bladeburner-manager.js":     true,    // bladeburner autopilot — actions, skills, anti-chaos
+
+    // Individual managers (user-supplied; skipped silently if missing)
     "stats.js":                   true,
-    "gangs.js":                   true,
-    "bladeburner.js":             true,
     "stockmaster.js":             false,
     "sleeve.js":                  false,
     "faction-manager.js":         false,

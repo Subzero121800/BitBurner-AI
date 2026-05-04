@@ -1,6 +1,6 @@
 /** @param {NS} ns */
 export async function main(ns) {
-  // WATCHDOG_VERSION_5
+  // WATCHDOG_VERSION_6
   ns.disableLog("ALL");
   try { ns.ui?.openTail?.(); } catch (_) {}
 
@@ -18,8 +18,10 @@ export async function main(ns) {
   const FLUSH_EVERY    = 15;
   const SINK_BASE      = "http://127.0.0.1:9999/sink/";
   const LOG_TARGETS    = [
-    { file: "/logs/scb.txt",           name: "scb" },
-    { file: "/logs/ollama-player.txt", name: "ollama-player" },
+    { file: "/logs/scb.txt",                name: "scb" },
+    { file: "/logs/ollama-player.txt",      name: "ollama-player" },
+    { file: "/logs/gang.txt",               name: "gang" },
+    { file: "/logs/bladeburner.txt",        name: "bladeburner" },
   ];
 
   let lastMarker = readFileSafe(RESTART_FILE);
