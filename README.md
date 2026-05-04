@@ -66,6 +66,14 @@ logs/                  — Allowlisted dump space for AI-emitted logs
 
 ## Quick start
 
+### 0. Clone
+
+```sh
+git clone https://github.com/Subzero121800/BitBurner-AI.git
+cd BitBurner-AI
+chmod +x scb.sh
+```
+
 ### 1. Install Ollama
 
 Anywhere reachable from the Mac running scb. By default the watcher only
