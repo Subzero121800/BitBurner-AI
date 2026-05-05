@@ -1,60 +1,53 @@
 /**
- * gang-manager.js — gang autopilot v2 (AI-steerable)
+ * gang-manager.js — gang autopilot v3 (AI-steerable, full-control)
  *
- * GANG_MANAGER_VERSION_2
+ * GANG_MANAGER_VERSION_3
  *
- * What changed vs v1:
- *   • POLL_MS dropped from 30 s → 4 s. Gang stats tick every 2 s in
- *     the game; the v1 cadence was so slow that the loop printed the
- *     same numbers many cycles in a row and tasks barely escalated.
- *   • Per-member task escalation by combat-stat tier — no more
- *     "everyone does the same thing forever":
- *         < 200       Train Combat
- *         < 800       Mug People
- *         < 1500      Strongarm Civilians
- *         < 3000      Run a Con
- *         < 6000      Armed Robbery
- *         < 12000     Traffick Illegal Arms
- *         < 25000     Threaten & Blackmail
- *         < 60000     Human Trafficking
- *         else        Terrorism
- *     Wanted-ratio override pulls top members to Vigilante Justice
- *     when wantedLevel/respect > WANTED_RATIO_HIGH.
- *   • Auto-ascend threshold dropped 1.50× → 1.10×. Members ascend
- *     much more often, so combat stats compound faster (spaced
- *     enough that not everyone is retraining at once).
- *   • Territory Warfare auto-engages once power dominates the
- *     average (>= 1.5×) AND we hold < 100% territory; disengages
- *     once we hold 100%.
- *   • Per-cycle status line now shows respect/money/wanted rates
- *     so you can SEE progression instead of staring at a static
- *     "members=12/12" line.
+ * v3 controls EVERY gang activity exposed by the NS gang API:
+ *   • createGang    — joins via DEFAULT_FACTION (or directive override)
+ *   • recruitMember — up to MAX_MEMBERS (12)
+ *   • setMemberTask — per-member optimal-task scoring via
+ *                     getTaskStats (replaces v2's hardcoded ladder)
+ *   • ascendMember  — spaced thresholds: member 0 ascends at 1.50×,
+ *                     member 11 at 1.05× — produces ROLLING ascensions
+ *                     instead of all-at-once retrain pile-ups
+ *   • purchaseEquipment — TWO TIERS:
+ *      ‣ tier 1 (≤ EQUIP_TIER1_COST = $5M): buy whenever cash > cost
+ *      ‣ tier 2 (> $5M): respect savings policy. Both equipment AND
+ *        augmentations flow through this loop (NS API lumps them).
+ *   • setTerritoryWarfare — engage when dominating + territory < 100%
  *
  * Reads:  /Temp/economy.json (savings policy)
- *         /Temp/gang-directives.json (AI override, optional, expires 10 min)
+ *         /Temp/gang-directives.json (AI override, expires 10 min)
  * Writes: /Temp/gang-state.json (per-cycle snapshot for the AI)
  *         /logs/gang.txt (rotates at 256 KB)
  *
  * Directive shape (set via the AI's `set_gang_plan` action):
  *   {
  *     "ts": <epoch ms>,
- *     "createFaction":   "Slum Snakes",   // override on createGang
- *     "memberOverrides": { "Alpha": "Vigilante Justice", ... },
- *     "allowEquipment":  true,            // false to pause equip buying
- *     "warfareOverride": null,            // true | false | null (=auto)
- *     "ascendThreshold": 1.10,            // override per-cycle
- *     "trainingFloor":   200              // override stat-sum cutoff for Train Combat
+ *     "createFaction":     "Slum Snakes",
+ *     "memberOverrides":   { "Alpha": "Vigilante Justice", ... },
+ *     "allowEquipment":    true,
+ *     "warfareOverride":   null,         // true | false | null (=auto)
+ *     "ascendThreshold":   1.20,         // override base ascend threshold
+ *     "trainingFloor":     200,
+ *     "focus":             "respect",    // "respect" | "money"
+ *     "equipBudgetPct":    0.01,         // pct of liquid cash per cycle
+ *     "equipTier1Cost":    5000000       // $ ceiling for "always-buy" tier
  *   }
  */
 
 const POLL_MS              = 4_000;
 const MAX_MEMBERS          = 12;
-const ASCEND_THRESHOLD     = 1.10;        // avg multiplier across str/def/dex/agi
-const WARFARE_POWER_RATIO  = 1.5;         // engage when our power > avg * ratio
-const WANTED_RATIO_HIGH    = 0.10;        // wantedLevel/respect threshold
-const VIGILANTE_FRACTION   = 0.40;        // pull this fraction of high-stat members to vigilante
-const TRAINING_FLOOR       = 200;         // stat-sum below which we train
-const STATUS_EVERY_CYCLES  = 8;           // print status line every Nth cycle (≈ 32 s)
+const ASCEND_BASE          = 1.05;        // floor — member 11 ascends at this
+const ASCEND_SPACING       = 0.05;        // each member up the list ascends 0.05× higher
+const WARFARE_POWER_RATIO  = 1.5;
+const WANTED_RATIO_HIGH    = 0.10;
+const VIGILANTE_FRACTION   = 0.40;
+const TRAINING_FLOOR       = 100;
+const STATUS_EVERY_CYCLES  = 8;
+const EQUIP_BUDGET_PCT     = 0.01;        // 1% of liquid cash per cycle on equipment
+const EQUIP_TIER1_COST     = 5_000_000;   // ≤ this is "always buy" if affordable
 
 const LOG_FILE             = "/logs/gang.txt";
 const LOG_PREV             = "/logs/gang.1.txt";
@@ -70,30 +63,23 @@ const MEMBER_NAMES = [
   "Golf", "Hotel", "India", "Juliet", "Kilo", "Lima"
 ];
 
-// Tiers used by combat gangs. Charisma-relevant tasks like "Human
-// Trafficking" still benefit from raw stat sum so we leave them in the
-// ladder; if your save is a hacking gang, consider replacing these
-// names with the hacking equivalents (Phishing Scams, Money Laundering,
-// etc.) — set them via `set_gang_plan` directives or fork this file.
-const TASK_LADDER = [
-  { upTo:    200, task: "Train Combat" },
-  { upTo:    800, task: "Mug People" },
-  { upTo:   1500, task: "Strongarm Civilians" },
-  { upTo:   3000, task: "Run a Con" },
-  { upTo:   6000, task: "Armed Robbery" },
-  { upTo:  12000, task: "Traffick Illegal Arms" },
-  { upTo:  25000, task: "Threaten & Blackmail" },
-  { upTo:  60000, task: "Human Trafficking" },
-  { upTo: Infinity, task: "Terrorism" }
-];
+// Tasks we treat specially and exclude from the auto-scoring pool.
+const SPECIAL_TASKS = new Set([
+  "Unassigned", "Vigilante Justice", "Territory Warfare",
+  "Train Combat", "Train Hacking", "Train Charisma"
+]);
+
+// Cache task stats (constant across the run) and equipment metadata.
+let TASK_STATS_CACHE  = null;
+let EQUIPMENT_CACHE   = null;  // [{ name, cost, type, stats }]
 
 /** @param {NS} ns */
 export async function main(ns) {
   ns.disableLog("ALL");
   try { ns.ui?.openTail?.(); } catch (_) {}
 
-  ns.print("INFO  gang-manager v2 up (poll " + POLL_MS + "ms)");
-  appendLog(ns, "START gang-manager v2");
+  ns.print("INFO  gang-manager v3 up (poll " + POLL_MS + "ms)");
+  appendLog(ns, "START gang-manager v3");
 
   let cycle = 0;
   let lastSnapshot = null;
@@ -103,7 +89,6 @@ export async function main(ns) {
     cycle++;
     try {
       const result = await tick(ns);
-      // Every Nth cycle, print a status line with rates.
       if (result && (cycle % STATUS_EVERY_CYCLES === 0 || lastSnapshot === null)) {
         printStatus(ns, result, lastSnapshot, lastSnapshotTime);
         lastSnapshot = result;
@@ -121,22 +106,23 @@ export async function main(ns) {
 async function tick(ns) {
   const directives = readDirectives(ns);
 
+  // 0) join a gang if we aren't in one
   if (!ns.gang.inGang()) {
     const faction = directives.createFaction || DEFAULT_FACTION;
-    if (!ns.gang.createGang(faction)) {
-      // Quiet — printed once at startup is enough; don't spam every 4s
-      return null;
-    }
+    if (!ns.gang.createGang(faction)) return null;
     appendLog(ns, "JOIN created gang via " + faction);
+    TASK_STATS_CACHE = null; // re-cache once we know hack vs combat
   }
 
-  const info    = ns.gang.getGangInformation();
-  const members = ns.gang.getMemberNames();
-  const econ    = readEconomy(ns);
-  const ascendThr = Number(directives.ascendThreshold) || ASCEND_THRESHOLD;
-  const trainFloor = Number(directives.trainingFloor) || TRAINING_FLOOR;
+  const info     = ns.gang.getGangInformation();
+  const isHack   = !!info.isHacking;
+  const focus    = directives.focus || (info.respect < 1e6 ? "respect" : "money");
+  const taskCache = getTaskStats(ns);
+  const wantedRatio = info.respect > 0 ? info.wantedLevel / info.respect : 0;
+  const overflow    = wantedRatio > WANTED_RATIO_HIGH;
 
-  // 1) recruit up to MAX_MEMBERS
+  // 1) recruit
+  const members = ns.gang.getMemberNames();
   while (members.length < MAX_MEMBERS && ns.gang.canRecruitMember()) {
     const name = MEMBER_NAMES[members.length];
     if (!ns.gang.recruitMember(name)) break;
@@ -144,87 +130,90 @@ async function tick(ns) {
     appendLog(ns, "RECRUIT " + name + " (now " + members.length + ")");
   }
 
-  // 2) compute wanted ratio — drives Vigilante override
-  const wantedRatio = info.respect > 0 ? info.wantedLevel / info.respect : 0;
-  const overflow = wantedRatio > WANTED_RATIO_HIGH;
-
-  // 3) collect member info, sort by stat sum desc — the strongest go
-  //    on Vigilante when wanted is high (they recover wanted faster).
-  const memberRecords = members.map(name => {
+  // 2) collect per-member info, sort strongest first (vigilante goes
+  //    to top members; bottom members handle income).
+  const records = members.map(name => {
     const m = ns.gang.getMemberInformation(name);
-    const sum = (m.str || 0) + (m.def || 0) + (m.dex || 0) + (m.agi || 0);
+    const sum = (m.hack || 0) + (m.str || 0) + (m.def || 0)
+              + (m.dex || 0) + (m.agi || 0) + (m.cha || 0);
     return { name, m, sum };
   }).sort((a, b) => b.sum - a.sum);
 
+  // 3) per-member task scoring — replaces v2's hardcoded ladder.
   const memberOverrides = directives.memberOverrides || {};
-  const vigilanteCount = overflow ? Math.max(1, Math.floor(memberRecords.length * VIGILANTE_FRACTION)) : 0;
-  let assigned = 0;
+  const trainFloor      = Number(directives.trainingFloor) || TRAINING_FLOOR;
+  const vigilanteCount  = overflow ? Math.max(1, Math.floor(records.length * VIGILANTE_FRACTION)) : 0;
 
-  for (let i = 0; i < memberRecords.length; i++) {
-    const { name, m, sum } = memberRecords[i];
+  let assigned = 0;
+  const taskAssignments = {};
+
+  for (let i = 0; i < records.length; i++) {
+    const { name, m, sum } = records[i];
     let task;
     if (memberOverrides[name]) {
       task = memberOverrides[name];                                       // AI override
     } else if (i < vigilanteCount) {
-      task = "Vigilante Justice";                                         // wanted-control
+      task = "Vigilante Justice";                                         // wanted control
     } else if (sum < trainFloor) {
-      task = "Train Combat";                                              // baseline training
+      task = isHack ? "Train Hacking" : "Train Combat";
     } else {
-      task = pickTaskForStats(sum);                                       // ladder
+      task = pickBestTask(taskCache, m, isHack, focus);
     }
+    taskAssignments[name] = task;
+
     if (m.task !== task) {
       if (ns.gang.setMemberTask(name, task)) {
         assigned++;
-        appendLog(ns, "TASK " + name + " (" + Math.round(sum) + ") -> " + task +
+        appendLog(ns, "TASK " + name + " (Σ=" + Math.round(sum) + ") -> " + task +
                       (memberOverrides[name] ? " [directive]" : ""));
       }
     }
   }
 
-  // 4) ascend high-multiplier members. Lower threshold + space them
-  //    out (only ascend one per cycle so the gang isn't all retraining).
+  // 4) ascend with SPACED thresholds. Member 0 (strongest) ascends
+  //    at the highest threshold; member 11 at the lowest. This
+  //    produces rolling ascensions — the gang isn't all retraining
+  //    at the same time.
+  const ascendBase = Number(directives.ascendThreshold) || ASCEND_BASE;
   let ascended = false;
-  for (const { name } of memberRecords) {
+  for (let i = 0; i < records.length; i++) {
     if (ascended) break;
+    const { name } = records[i];
     let next = null;
     try { next = ns.gang.getAscensionResult(name); } catch (_) {}
     if (!next) continue;
-    const avg = ((next.str || 0) + (next.def || 0) + (next.dex || 0) + (next.agi || 0)) / 4;
-    if (avg < ascendThr) continue;
+    const stats = isHack
+      ? [next.hack]
+      : [next.str || 1, next.def || 1, next.dex || 1, next.agi || 1];
+    const avgMult = stats.reduce((s, v) => s + (v || 0), 0) / stats.length;
+    // Strongest gets highest threshold (don't ascend lightly), weakest the lowest.
+    const myThreshold = ascendBase + (records.length - 1 - i) * ASCEND_SPACING;
+    if (avgMult < myThreshold) continue;
     if (ns.gang.ascendMember(name)) {
-      ns.print("SUCCESS  Ascended " + name + " (avg " + avg.toFixed(2) + "x)");
-      appendLog(ns, "ASCEND " + name + " avg=" + avg.toFixed(2));
+      ns.print("SUCCESS  Ascended " + name + " (avg " + avgMult.toFixed(2) +
+               "× ≥ " + myThreshold.toFixed(2) + "×)");
+      appendLog(ns, "ASCEND " + name + " avg=" + avgMult.toFixed(2) +
+                    " threshold=" + myThreshold.toFixed(2));
       ascended = true;
     }
   }
 
-  // 5) equipment — only when savings unlocked AND directive doesn't
-  //    disable it. Buy one item per cycle to spread the spend out.
+  // 5) equipment + augmentations — two-tier buying.
+  //    Tier 1 (≤ EQUIP_TIER1_COST): always buy if affordable. Cheap
+  //    items compound stat growth fast and are cheap enough that
+  //    they don't meaningfully threaten savings.
+  //    Tier 2 (> tier1 cost): respect savings policy.
   const equipAllowed = directives.allowEquipment !== false;
+  const tier1Ceiling = Number(directives.equipTier1Cost) || EQUIP_TIER1_COST;
+  const budgetPct    = typeof directives.equipBudgetPct === "number"
+                       ? directives.equipBudgetPct
+                       : EQUIP_BUDGET_PCT;
   let equipped = 0;
-  if (equipAllowed && econ && econ.savingsThreshold !== undefined) {
-    const cash      = ns.getServerMoneyAvailable("home");
-    const threshold = econ.savingsThreshold;
-    if (cash >= threshold) {
-      outer: for (const equip of ns.gang.getEquipmentNames()) {
-        let cost = Infinity;
-        try { cost = ns.gang.getEquipmentCost(equip); } catch (_) {}
-        if (cost === Infinity || cash - cost < threshold) continue;
-        for (const { name, m } of memberRecords) {
-          const owned = (m.upgrades || []).concat(m.augmentations || []);
-          if (owned.includes(equip)) continue;
-          if (ns.gang.purchaseEquipment(name, equip)) {
-            equipped++;
-            appendLog(ns, "EQUIP " + name + " " + equip + " ($" + cost.toLocaleString() + ")");
-            break outer; // one purchase per cycle
-          }
-        }
-      }
-    }
+  if (equipAllowed) {
+    equipped = buyGear(ns, records, tier1Ceiling, budgetPct);
   }
 
-  // 6) territory warfare — directive override OR auto-engage when
-  //    we dominate AND we don't already hold 100% territory.
+  // 6) territory warfare
   let warfareDecision = null;
   try {
     const all = ns.gang.getAllGangInformation();
@@ -245,23 +234,19 @@ async function tick(ns) {
       ns.gang.setTerritoryWarfare(dominate);
       appendLog(ns, "WARFARE " + (dominate ? "ON" : "OFF") +
                     " (us=" + (ours?.power || 0).toFixed(0) +
-                    " avg=" + avgOther.toFixed(0) +
-                    " ours_territory=" + ((ours?.territory || 0) * 100).toFixed(1) + "%)" +
-                    (typeof directives.warfareOverride === "boolean" ? " [directive]" : ""));
+                    " avg=" + avgOther.toFixed(0) + ")");
     }
     warfareDecision = dominate;
-  } catch (_) { /* warfare API can throw early-game */ }
+  } catch (_) {}
 
-  // 7) publish per-cycle state for the AI player.
-  // The `version` field doubles as a freshness marker for scb.js's
-  // companion launcher — if the disk file's marker doesn't match
-  // this, scb.js kills the running instance so the new version
-  // gets re-spawned.
+  // 7) per-cycle state for the AI
   const snapshot = {
     ts:                Date.now(),
-    version:           "GANG_MANAGER_VERSION_2",
+    version:           "GANG_MANAGER_VERSION_3",
     inGang:            true,
     faction:           info.faction,
+    isHacking:         isHack,
+    focus,
     members:           members.length,
     respect:           info.respect,
     respectGainRate:   info.respectGainRate,
@@ -272,32 +257,146 @@ async function tick(ns) {
     power:             info.power,
     territory:         info.territory,
     territoryWarfare:  info.territoryWarfareEngaged,
+    bonusTime:         safe(() => ns.gang.getBonusTime()) || 0,
+    taskAssignments,
     cycle: { assigned, ascended, equipped, warfare: warfareDecision }
   };
   try { ns.write(STATE_FILE, JSON.stringify(snapshot, null, 2), "w"); } catch (_) {}
   return snapshot;
 }
 
-function pickTaskForStats(sum) {
-  for (const tier of TASK_LADDER) {
-    if (sum < tier.upTo) return tier.task;
+// ─── task scoring ───────────────────────────────────────────────────
+function getTaskStats(ns) {
+  if (TASK_STATS_CACHE) return TASK_STATS_CACHE;
+  TASK_STATS_CACHE = {};
+  let names;
+  try { names = ns.gang.getTaskNames(); } catch (_) { return TASK_STATS_CACHE; }
+  for (const n of names) {
+    try { TASK_STATS_CACHE[n] = ns.gang.getTaskStats(n); } catch (_) {}
   }
-  return TASK_LADDER[TASK_LADDER.length - 1].task;
+  return TASK_STATS_CACHE;
 }
 
+// Simplified Bitburner gang task gain formula. A member's contribution
+// to a task scales with their stats weighted by the task's stat
+// weights, divided by task difficulty. We score by yield-per-second
+// of either respect (early game) or money (late game), prioritising
+// tasks the member is actually effective at.
+function pickBestTask(taskCache, member, isHack, focus) {
+  const fallback = isHack ? "Train Hacking" : "Train Combat";
+  let best = fallback;
+  let bestScore = 0;
+
+  for (const [name, t] of Object.entries(taskCache)) {
+    if (SPECIAL_TASKS.has(name)) continue;
+    if (t.isHacking && !isHack) continue;
+    if (t.isCombat && isHack) continue;
+
+    // Member's weighted stat for this task
+    const w = (
+      (member.hack_asc_mult || 1) * (member.hack || 0) * (t.hackWeight || 0) +
+      (member.str_asc_mult  || 1) * (member.str  || 0) * (t.strWeight  || 0) +
+      (member.def_asc_mult  || 1) * (member.def  || 0) * (t.defWeight  || 0) +
+      (member.dex_asc_mult  || 1) * (member.dex  || 0) * (t.dexWeight  || 0) +
+      (member.agi_asc_mult  || 1) * (member.agi  || 0) * (t.agiWeight  || 0) +
+      (member.cha_asc_mult  || 1) * (member.cha  || 0) * (t.chaWeight  || 0)
+    ) / 100;
+    const difficulty = Math.max(1, t.difficulty || 1);
+
+    // Effectiveness: roughly weightedStat / difficulty, capped at 1.
+    const effectiveness = Math.min(1, w / (difficulty * 100));
+    if (effectiveness < 0.05) continue;
+
+    const respectMod = (t.territory && t.territory.respect) || 1;
+    const moneyMod   = (t.territory && t.territory.money)   || 1;
+
+    const yieldScore = focus === "money"
+      ? (t.baseMoney   || 0) * moneyMod   * effectiveness
+      : (t.baseRespect || 0) * respectMod * effectiveness;
+
+    if (yieldScore > bestScore) {
+      bestScore = yieldScore;
+      best = name;
+    }
+  }
+  return bestScore > 0 ? best : fallback;
+}
+
+// ─── equipment / augmentation buying ───────────────────────────────
+function getEquipmentCache(ns) {
+  if (EQUIPMENT_CACHE) return EQUIPMENT_CACHE;
+  EQUIPMENT_CACHE = [];
+  let names;
+  try { names = ns.gang.getEquipmentNames(); } catch (_) { return EQUIPMENT_CACHE; }
+  for (const n of names) {
+    try {
+      EQUIPMENT_CACHE.push({
+        name: n,
+        cost: ns.gang.getEquipmentCost(n),
+        type: ns.gang.getEquipmentType ? ns.gang.getEquipmentType(n) : "Equipment"
+      });
+    } catch (_) {}
+  }
+  EQUIPMENT_CACHE.sort((a, b) => a.cost - b.cost);
+  return EQUIPMENT_CACHE;
+}
+
+function buyGear(ns, records, tier1Ceiling, budgetPct) {
+  const equipment = getEquipmentCache(ns);
+  if (!equipment.length) return 0;
+
+  const econ = readEconomy(ns);
+  const savingsThreshold = econ?.savingsThreshold || 0;
+  let purchased = 0;
+
+  for (const equip of equipment) {
+    const cash = ns.getServerMoneyAvailable("home");
+    if (cash < equip.cost) break; // sorted ascending — nothing else affordable
+
+    const isTier1 = equip.cost <= tier1Ceiling;
+    if (!isTier1) {
+      // Tier 2: respect savings AND a per-cycle budget cap.
+      const headroomCash = Math.max(0, cash - savingsThreshold);
+      const maxSpendThisCycle = headroomCash * budgetPct;
+      if (cash - equip.cost < savingsThreshold) continue;     // would breach savings
+      if (equip.cost > maxSpendThisCycle && purchased > 0) continue; // budget exhausted
+    }
+
+    for (const { name, m } of records) {
+      const owned = (m.upgrades || []).concat(m.augmentations || []);
+      if (owned.includes(equip.name)) continue;
+      const cashNow = ns.getServerMoneyAvailable("home");
+      if (cashNow < equip.cost) return purchased;
+      if (!isTier1 && cashNow - equip.cost < savingsThreshold) return purchased;
+      if (ns.gang.purchaseEquipment(name, equip.name)) {
+        purchased++;
+        appendLog(ns, "EQUIP " + name + " " + equip.name + " (" + equip.type +
+                      ", $" + equip.cost.toLocaleString() + ")");
+        // Update local member record so we don't re-buy in this cycle
+        m.upgrades = (m.upgrades || []).concat([equip.name]);
+        break;
+      }
+    }
+  }
+  return purchased;
+}
+
+// ─── status / state helpers ────────────────────────────────────────
 function printStatus(ns, snap, prev, prevTime) {
-  const dt = prev ? (Date.now() - prevTime) / 1000 : 0;
-  const dRespect = prev ? Math.max(0, snap.respect - prev.respect) : 0;
-  const respectPerSec = dt > 0 ? dRespect / dt : 0;
-  const moneyPerSec = snap.moneyGainRate * 5;     // game scales gain rate per 5s
   const respectGain = snap.respectGainRate * 5;
+  const moneyGain   = snap.moneyGainRate * 5;
+  const tasksUsed   = new Set(Object.values(snap.taskAssignments));
   ns.print(
     "INFO  members=" + snap.members + "/" + MAX_MEMBERS +
+    " " + (snap.isHacking ? "HACK-gang" : "COMBAT-gang") +
+    " focus=" + snap.focus +
     " respect=" + fmt(snap.respect) + " (+" + fmt(respectGain) + "/5s)" +
-    " $/5s=" + fmt(moneyPerSec) +
-    " wanted=" + fmt(snap.wanted) + " ratio=" + (snap.wantedRatio * 100).toFixed(2) + "%" +
+    " $/5s=" + fmt(moneyGain) +
+    " wanted=" + fmt(snap.wanted) + " (" + (snap.wantedRatio * 100).toFixed(2) + "%)" +
     " power=" + fmt(snap.power) +
-    " terr=" + ((snap.territory || 0) * 100).toFixed(1) + "%"
+    " terr=" + ((snap.territory || 0) * 100).toFixed(1) + "%" +
+    " tasks=[" + Array.from(tasksUsed).join(", ") + "]" +
+    (snap.bonusTime > 1000 ? " bonus=" + (snap.bonusTime / 1000).toFixed(0) + "s" : "")
   );
 }
 
@@ -324,6 +423,8 @@ function readEconomy(ns) {
     return JSON.parse(ns.read("/Temp/economy.json")) || null;
   } catch (_) { return null; }
 }
+
+function safe(fn) { try { return fn(); } catch (_) { return null; } }
 
 function appendLog(ns, line) {
   try {
