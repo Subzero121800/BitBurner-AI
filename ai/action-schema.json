@@ -1,0 +1,100 @@
+{
+  "version": "SCHEMA_JSON_VERSION_1",
+  "schema": [
+    { "action": "hack",        "args": ["target"],            "desc": "Deploy hack workers" },
+    { "action": "grow",        "args": ["target"],            "desc": "Deploy grow workers" },
+    { "action": "weaken",      "args": ["target"],            "desc": "Deploy weaken workers" },
+    { "action": "deploy_hack", "args": ["target", "server"],  "desc": "Split deploy on a server" },
+
+    { "action": "travel",   "args": ["city"],   "desc": "Travel to a city" },
+    { "action": "connect",  "args": ["server"], "desc": "Connect terminal to a server" },
+    { "action": "backdoor", "args": ["server"], "desc": "Install a backdoor" },
+
+    { "action": "work_company", "args": ["company"],          "desc": "Work at a company" },
+    { "action": "work_faction", "args": ["faction", "type"],  "desc": "Work for a faction" },
+    { "action": "study",        "args": ["course", "place"],  "desc": "Take a university course" },
+    { "action": "gym",          "args": ["stat", "place"],    "desc": "Train a stat at a gym" },
+    { "action": "commit_crime", "args": ["crime"],            "desc": "Commit a crime" },
+
+    { "action": "buy_program",      "args": ["program"],         "desc": "Buy a hacking program" },
+    { "action": "buy_server",       "args": ["ram"],             "desc": "Purchase a new server" },
+    { "action": "upgrade_server",   "args": ["server", "ram"],   "desc": "Upgrade a purchased server" },
+    { "action": "buy_augmentation", "args": ["faction", "aug"],  "desc": "Buy an augmentation" },
+    { "action": "buy_hacknet_node", "args": [],                  "desc": "Buy a hash-farm node" },
+    { "action": "upgrade_hacknet",  "args": ["node", "type"],    "desc": "Upgrade a hash-farm node" },
+
+    { "action": "join_faction",   "args": ["faction"],            "desc": "Accept a faction invite" },
+    { "action": "donate_faction", "args": ["faction", "amount"],  "desc": "Donate to a faction" },
+
+    { "action": "sleeve_task", "args": ["clone", "task"], "desc": "Assign a clone task" },
+
+    { "action": "gang_recruit", "args": [],                  "desc": "Recruit a crew member" },
+    { "action": "gang_assign",  "args": ["member", "task"],  "desc": "Assign a crew member task" },
+    { "action": "gang_ascend",  "args": ["member"],          "desc": "Ascend a crew member" },
+
+    { "action": "bb_action", "args": ["type", "name"], "desc": "Start a BB action" },
+    { "action": "bb_skill",  "args": ["skill"],        "desc": "Upgrade a BB skill" },
+
+    { "action": "install_augmentations", "args": [],     "desc": "Install queued augs and reset" },
+    { "action": "soft_reset",            "args": [],     "desc": "Soft reset" },
+    { "action": "wait",                  "args": ["ms"], "desc": "Sleep for milliseconds" },
+    { "action": "noop",                  "args": [],     "desc": "Do nothing" },
+
+    { "action": "read_file",              "args": ["path"],                                  "desc": "Read a file" },
+    { "action": "list_files",             "args": ["prefix?"],                               "desc": "List files" },
+    { "action": "write_generated_script", "args": ["path", "content"],                       "desc": "Write a script under an allowed dir" },
+    { "action": "delete_generated_script","args": ["path"],                                  "desc": "Delete a script under an allowed dir" },
+    { "action": "run_script",             "args": ["script", "host?", "threads?", "argv?"], "desc": "Run a script under an allowed dir" },
+    { "action": "kill_script",            "args": ["script", "host?"],                       "desc": "Kill instances of a script" },
+    { "action": "copy_script",            "args": ["script", "dst_host"],                    "desc": "Copy a script from home to dst" },
+    { "action": "propose_patch",          "args": ["target", "content", "reason"],           "desc": "Propose a patch to a protected file" },
+
+    { "action": "reconnect_remote_api",   "args": [], "desc": "Click Options Remote API Connect via DOM" },
+
+    { "action": "set_sleeve_plan",      "args": ["plan"], "desc": "Steer the clone manager" },
+    { "action": "set_gang_plan",        "args": ["plan"], "desc": "Steer the crew manager" },
+    { "action": "set_bladeburner_plan", "args": ["plan"], "desc": "Steer the BB manager" }
+  ],
+  "dispatchMap": {
+    "hack": "deploy", "grow": "deploy", "weaken": "deploy", "deploy_hack": "deploy",
+
+    "travel": "S", "connect": "S", "backdoor": "S",
+    "work_company": "S", "work_faction": "S",
+    "study": "S", "gym": "S", "commit_crime": "S",
+    "buy_program": "S", "buy_augmentation": "S",
+    "join_faction": "S", "donate_faction": "S",
+    "install_augmentations": "S", "soft_reset": "S",
+
+    "buy_server": "C", "upgrade_server": "C",
+
+    "sleeve_task": "L",
+
+    "gang_recruit": "G", "gang_assign": "G", "gang_ascend": "G",
+
+    "buy_hacknet_node": "H", "upgrade_hacknet": "H",
+
+    "bb_action": "B", "bb_skill": "B",
+
+    "read_file": "F", "list_files": "F",
+    "write_generated_script": "F", "delete_generated_script": "F",
+    "run_script": "F", "kill_script": "F", "copy_script": "F",
+    "propose_patch": "F",
+
+    "reconnect_remote_api": "U",
+
+    "noop": "I", "wait": "I",
+    "set_sleeve_plan": "I", "set_gang_plan": "I", "set_bladeburner_plan": "I"
+  },
+  "categoryToFile": {
+    "deploy": "/ai/dispatch/deploy.js",
+    "S":      "/ai/dispatch/singularity.js",
+    "C":      "/ai/dispatch/cloud.js",
+    "L":      "/ai/dispatch/sleeve.js",
+    "G":      "/ai/dispatch/gang.js",
+    "H":      "/ai/dispatch/hacknet.js",
+    "B":      "/ai/dispatch/blade.js",
+    "F":      "/ai/dispatch/fs.js",
+    "U":      "/ai/dispatch/ui.js",
+    "I":      "inline"
+  }
+}

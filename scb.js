@@ -1,7 +1,19 @@
 /**
  * scb.js — Master Orchestrator
  * Bitburner 3.0.0 compatible
- * SCB_VERSION_11_SINGLETON_RUNNER
+ * SCB_VERSION_13_THIN
+ *
+ * v13 also slims scb.js itself by spawning helpers under /helpers/:
+ *   - /helpers/shop.js          (TOR + program purchases)
+ *   - /helpers/stanek-check.js  (Stanek active-fragment probe)
+ *   - /helpers/pserv-deploy.js  (purchased-server hack/share fallback)
+ * The orchestrator no longer references singularity, stanek, or cloud
+ * directly, so its resident RAM drops from ~19 GB to ~8 GB. Helpers
+ * pay their namespace cost only while running (a few hundred ms).
+ *
+ * v12 introduced the /ai/snap/ + /ai/dispatch/ helper architecture
+ * for the AI player; see README -> "RAM cost & limiting in-game
+ * memory" for the full picture.
  */
 
 const FLAGS = {
@@ -26,11 +38,13 @@ const FLAGS = {
   // run the orchestrator + a couple of companions without trying
   // to launch a $66 GB stack on a $32 GB home.
   //
-  // Suggested values:
+  // Suggested values (measured in-game; see README → "RAM cost &
+  // limiting in-game memory"):
   //   0     unlimited (current behaviour)
-  //   16    fresh save / pre-augmentation runs (orchestrator + watchdog)
-  //   48    add the AI player (deepseek-coder-v2:16b)
-  //   96    add gang-manager + bladeburner-manager
+  //   24    orchestrator + watchdog only (~20.65 GB)
+  //   48    add the v9 AI player (~27 GB; transient helpers fit in headroom)
+  //   96    add one heavy companion — gang OR bladeburner (~59 GB)
+  //   128   add gang + bladeburner + sleeve managers (~115 GB; full stack)
   maxInGameRamGB:    0,
 
   // Autonomous AI player (Ollama backend — local or LAN endpoint)
@@ -100,11 +114,14 @@ const AI_CONFIG = {
   // ── Connectivity ─────────────────────────────────────────────────
   backend:      "ollama",
   ollamaHost:   "http://127.0.0.1:11434",
-  // deepseek-coder-v2:16b is a coding-tuned model that's strong
-  // enough to read /ollama-actions.js, /ollama-player.js and emit
-  // coherent propose_patch payloads — the 8B fallback couldn't.
-  // Swap to llama3.1:70b or qwen2.5-coder:32b on a beefier box.
-  ollamaModel:  "deepseek-coder-v2:16b",
+  // qwen3-coder:30b is the sweet spot for a Jetson Thor / 24+ GB
+  // VRAM box: code-tuned, excellent structured-JSON output, reads
+  // /ollama-player.js + /ollama-actions.js coherently for
+  // propose_patch. ~18 GB on disk at Q4_K_M. Smaller fallbacks for
+  // weaker LAN boxes: deepseek-coder-v2:16b (~9 GB) or
+  // qwen2.5-coder:7b (~5 GB). Skip the deepseek-r1 family — its
+  // <think> tags break parseActions.
+  ollamaModel:  "qwen3-coder:30b",
   claudeHost:   "http://localhost:3000",
   claudeModel:  "sonnet",
   // 5-minute poll — the AI is the strategic layer; tactical work
@@ -112,7 +129,7 @@ const AI_CONFIG = {
   // savings + jam-suppression keep it from doing anything dumb
   // between cycles. Drop to 60-120 s if you want faster reactions.
   pollInterval: 300_000,
-  // 16B-class inferences run ~30-60 s on most hardware. 30 s
+  // 30B-class inferences run ~20-60 s on a Jetson Thor. 30 s
   // would constantly abort.
   timeoutMs:     90_000,
 
@@ -120,9 +137,11 @@ const AI_CONFIG = {
   // Sampling temp: 0.0 = deterministic, 0.7 = creative. Low is
   // generally better for actuator-style agents.
   temperature:  0.2,
-  // Ollama context window — increase if recentActions starts getting
-  // truncated in your model's context.
-  numCtx:       8192,
+  // Ollama context window. Bumped from 8192 to 16384 for v9 — the
+  // game state + rules + recentActions runs ~4-6 K tokens and the
+  // Thor has VRAM headroom for the bigger window. Drop back to
+  // 8192 on smaller LAN boxes.
+  numCtx:       16384,
 
   // ── Self-context tuning ──────────────────────────────────────────
   // How many recent /logs/ollama-player.txt lines to feed back into
@@ -247,6 +266,16 @@ export async function main(ns) {
     if (FLAGS.ollamaPlayer) {
       const ok = ensurePlayerScripts(ns);
       if (ok) {
+        // Refresh the JSON snapshots before the player ticks. Each
+        // helper runs once and exits in <1 s, so the per-namespace RAM
+        // cost only materialises during execution.
+        launchSnapshots(ns);
+        // Auto-bounce on version mismatch — same mechanism the companion
+        // managers use. Player publishes /Temp/ollama-player-state.json
+        // each cycle with its source version marker; if the disk file's
+        // marker has moved past the running snapshot, kill so the next
+        // ensureRunning re-spawns the new code.
+        ensureCompanionFresh(ns, "/ollama-player.js");
         ensureRunning(
           ns,
           "/ollama-player.js",
@@ -263,7 +292,15 @@ export async function main(ns) {
     const hackLvl = player.skills.hacking;
 
     if (FLAGS.buyTor || FLAGS.buyPrograms) {
-      await buyToolsIfAffordable(ns);
+      // v13: spawned helper instead of inline calls so scb.js doesn't
+      // hold singularity RAM resident. Helper reads /Temp/economy.json
+      // for the cash floor, buys what's affordable, exits.
+      const shop = "/helpers/shop.js";
+      if (ns.fileExists(shop, "home") && !isRunningByFile(ns, shop)) {
+        if (withinRamBudget(ns, shop, 1)) {
+          try { ns.exec(shop, "home", 1); } catch (_) {}
+        }
+      }
     }
 
     const portCrax = getAvailablePortCrackers(ns);
@@ -367,20 +404,23 @@ export async function main(ns) {
     }
 
     // ─── Pserv deploy pass ────────────────────────────────────────
-    // The scan-and-root loop above skips purchased servers (they're
-    // already rooted by definition). They DO need workers though,
-    // and once they get freshly upgraded they sit empty. Sweep them
-    // here: deploy hack/grow/weaken targeting our best server, or
-    // fall back to share() when no useful target exists.
-    let pservDeployed = 0;
-    let pservShared   = 0;
+    // v13: spawned helper instead of inline so scb.js doesn't hold
+    // the cloud namespace RAM resident. Helper reads
+    // /Temp/network-state.json for the target ranking and writes
+    // /Temp/pserv-deploy-last.json with deploy/share counts.
     if (FLAGS.deployHackScripts) {
-      const result = deployToPservs(ns);
-      pservDeployed = result.deployed;
-      pservShared   = result.shared;
-      if (pservDeployed) ns.print("INFO  Pserv deploys: " + pservDeployed);
-      if (pservShared)   ns.print("INFO  Pserv share workers: " + pservShared + " (no hackable target → faction-rep boost)");
+      const pserv = "/helpers/pserv-deploy.js";
+      if (ns.fileExists(pserv, "home") && !isRunningByFile(ns, pserv)) {
+        if (withinRamBudget(ns, pserv, 1)) {
+          try { ns.exec(pserv, "home", 1); } catch (_) {}
+        }
+      }
     }
+    const pservLast = readJson(ns, "/Temp/pserv-deploy-last.json") || {};
+    const pservDeployed = pservLast.deployed || 0;
+    const pservShared   = pservLast.shared   || 0;
+    if (pservDeployed) ns.print("INFO  Pserv deploys: " + pservDeployed);
+    if (pservShared)   ns.print("INFO  Pserv share workers: " + pservShared + " (no hackable target → faction-rep boost)");
 
     ns.print("");
     ns.print("INFO  Rooted: " + rooted + " | Backdoor: " + backdoored + " | Deployed: " + deployed + "+" + pservDeployed + " | Shared: " + pservShared + " | Skipped: " + skipped);
@@ -435,7 +475,17 @@ function warnOnConflicts(ns) {
 }
 
 function launchCompanions(ns) {
-  const hasStanek = stanekIsActive(ns);
+  // v13: keep /Temp/stanek-state.json fresh by spawning a one-shot
+  // helper. We don't block on it — the snapshot from the previous
+  // cycle is good enough; stanek state changes rarely.
+  const stanekHelper = "/helpers/stanek-check.js";
+  if (ns.fileExists(stanekHelper, "home") && !isRunningByFile(ns, stanekHelper)) {
+    if (withinRamBudget(ns, stanekHelper, 1)) {
+      try { ns.exec(stanekHelper, "home", 1); } catch (_) {}
+    }
+  }
+  const stanekSnap = readJson(ns, "/Temp/stanek-state.json") || {};
+  const hasStanek = !!stanekSnap.active;
 
   ns.print(
     hasStanek
@@ -510,73 +560,11 @@ function ensureCompanionFresh(ns, file) {
   }
 }
 
-function stanekIsActive(ns) {
+function readJson(ns, path) {
   try {
-    const fragments = ns.stanek.activeFragments();
-    return fragments.length > 0;
-  } catch {
-    return false;
-  }
-}
-
-// Sweep all purchased servers (pserv-*). For each: if it has free
-// RAM and a worker isn't already running, deploy hack/grow/weaken
-// against the best target. If no target is reachable yet OR all
-// our cracked targets are saturated, fall back to share.js for the
-// faction-rep multiplier instead of leaving the server idle.
-function deployToPservs(ns) {
-  const SHARE = "share.js";
-  let deployed = 0;
-  let shared   = 0;
-  let owned;
-  try { owned = ns.cloud.getServerNames(); } catch (_) { return { deployed, shared }; }
-  if (!owned.length) return { deployed, shared };
-
-  ensureShareWorkerExists(ns, SHARE);
-
-  for (const host of owned) {
-    if (deployHackScripts(ns, host)) { deployed++; continue; }
-
-    // No hack target chose this server (e.g. early game, or fully
-    // saturated). Fall back to share() for the rep multiplier.
-    let free = 0;
-    try { free = ns.getServerMaxRam(host) - ns.getServerUsedRam(host); }
-    catch (_) { continue; }
-    let shareCost = 4;
-    try { shareCost = ns.getScriptRam(SHARE, "home") || 4; }
-    catch (_) {}
-    if (free < shareCost) continue;
-
-    // If there are already worker scripts running on this server,
-    // don't overwrite — let them work.
-    const ps = ns.ps(host);
-    const hasWorkers = ps.some(p =>
-      p.filename === "hack.js" || p.filename === "grow.js" || p.filename === "weaken.js"
-    );
-    if (hasWorkers) continue;
-
-    // If share is already running, leave it.
-    if (ps.some(p => p.filename === SHARE)) continue;
-
-    try { ns.scp(SHARE, host, "home"); } catch (_) { continue; }
-    const threads = Math.floor(free / shareCost);
-    if (threads < 1) continue;
-    if (ns.exec(SHARE, host, threads) > 0) {
-      shared++;
-      ns.print("SUCCESS  share() on " + host + " x" + threads);
-    }
-  }
-  return { deployed, shared };
-}
-
-async function ensureShareWorkerExists(ns, filename) {
-  if (ns.fileExists(filename, "home")) return;
-  // Tiny embedded fallback in case share.js wasn't synced from disk.
-  const code = [
-    "/** @param {NS} ns */",
-    "export async function main(ns) { while (true) await ns.share(); }",
-  ].join("\n");
-  ns.write(filename, code, "w");
+    if (!ns.fileExists(path, "home")) return null;
+    return JSON.parse(ns.read(path)) || null;
+  } catch (_) { return null; }
 }
 
 function deployHackScripts(ns, hostname) {
@@ -678,64 +666,50 @@ function pickBestTarget(ns) {
 }
 
 async function ensureBackdoorWorkerExists(ns, filename) {
+  // Standalone /backdoor-worker.js as of v13 — was an inline template
+  // string that inflated scb.js's RAM via the singularity connect /
+  // installBackdoor mentions. If it's missing, sync it from the repo.
   if (ns.fileExists(filename, "home")) return;
-
-  const code = [
-    "/** @param {NS} ns */",
-    "export async function main(ns) {",
-    "  const hostname = ns.args[0];",
-    "  const path = JSON.parse(ns.args[1]);",
-    "  ns.singularity.connect('home');",
-    "  for (const hop of path) ns.singularity.connect(hop);",
-    "  await ns.singularity.installBackdoor();",
-    "  ns.tprint('SUCCESS  Backdoored: ' + hostname);",
-    "  ns.singularity.connect('home');",
-    "}"
-  ].join("\n");
-
-  ns.write(filename, code, "w");
+  ns.print("ERROR  " + filename + " missing — sync it from the repo (it's a normal .js file now)");
 }
 
 async function ensureUpgraderExists(ns, filename) {
-  if (ns.fileExists(filename, "home")) {
-    const content = ns.read(filename);
-    if (content.includes("UPGRADER_VERSION_12_SAVINGS_AWARE")) return;
-
-    ns.rm(filename, "home");
-    ns.print("INFO  Regenerating server-upgrader.js");
+  // Standalone /server-upgrader.js as of v13 — was UPGRADER_CODE, a
+  // string template heavy with cloud namespace mentions. The disk file
+  // carries the same UPGRADER_VERSION_12 marker; we just verify it's
+  // present and current.
+  if (!ns.fileExists(filename, "home")) {
+    ns.print("ERROR  " + filename + " missing — sync it from the repo (it's a normal .js file now)");
+    return;
   }
-
-  ns.write(filename, UPGRADER_CODE, "w");
+  const content = ns.read(filename);
+  if (!content.includes("UPGRADER_VERSION_12_SAVINGS_AWARE")) {
+    ns.print("WARN  " + filename + " on disk does not carry UPGRADER_VERSION_12 marker — sync the repo file");
+  }
 }
 
 async function ensureContractorExists(ns, filename) {
-  if (ns.fileExists(filename, "home")) {
-    const content = ns.read(filename);
-    if (content.includes("CONTRACTOR_VERSION_1")) return;
-
-    ns.rm(filename, "home");
-    ns.print("INFO  Regenerating contractor.js");
+  // Standalone /contractor.js as of v13 — was a CONTRACTOR_CODE
+  // template embedded in scb.js that auto-regenerated. The disk file
+  // ships its own version marker; we just verify it's present.
+  if (!ns.fileExists(filename, "home")) {
+    ns.print("ERROR  " + filename + " missing — sync it from the repo");
   }
-
-  ns.write(filename, CONTRACTOR_CODE, "w");
 }
 
 async function ensureWatchdogExists(ns, filename) {
-  if (ns.fileExists(filename, "home")) {
-    const content = ns.read(filename);
-    if (content.includes("WATCHDOG_VERSION_2")) return;
-
-    ns.rm(filename, "home");
-    ns.print("INFO  Regenerating scb-watchdog.js");
+  // Standalone /scb-watchdog.js as of v13. If missing, we don't try
+  // to regen — let the user sync it from the repo. (Older scb.js
+  // versions clobbered a newer watchdog with an embedded v2 stub.)
+  if (!ns.fileExists(filename, "home")) {
+    ns.print("ERROR  " + filename + " missing — sync it from the repo");
   }
-
-  ns.write(filename, WATCHDOG_CODE, "w");
 }
 
 function ensurePlayerScripts(ns) {
   const need = [
-    { file: "/ollama-actions.js", marker: "ACTIONS_VERSION_4" },
-    { file: "/ollama-player.js",  marker: "PLAYER_VERSION_8"  }
+    { file: "/ollama-actions.js", marker: "ACTIONS_VERSION_5"  },
+    { file: "/ollama-player.js",  marker: "PLAYER_VERSION_10" }
   ];
 
   let ok = true;
@@ -754,7 +728,38 @@ function ensurePlayerScripts(ns) {
     }
   }
 
+  // The slim player (v9) reads JSON snapshots from /Temp/ instead
+  // of holding the singularity / cloud namespaces itself. Warn if
+  // any snap helper is missing — the player will still run but
+  // state fields will be empty until they're synced from disk.
+  const snaps = ["/ai/snap/network.js", "/ai/snap/cloud.js", "/ai/snap/progression.js"];
+  for (const s of snaps) {
+    if (!ns.fileExists(s, "home")) ns.print("WARN  " + s + " missing — player state will be partial");
+  }
+
   return ok;
+}
+
+// Launch the /ai/snap/*.js helpers if they aren't already running.
+// Each is a one-shot: reads game state, writes /Temp/<name>-state.json,
+// exits. We re-launch every scb cycle so the snapshots stay fresh
+// (~30 s) without keeping their per-namespace RAM cost resident.
+//
+// The player also self-bootstraps fresh snapshots on its own cycle
+// (see /ollama-player.js ensureSnapshotsFresh) so this is belt +
+// suspenders — either layer can keep them current.
+function launchSnapshots(ns) {
+  const helpers = [
+    "/ai/snap/network.js",
+    "/ai/snap/cloud.js",
+    "/ai/snap/progression.js"
+  ];
+  for (const file of helpers) {
+    if (!ns.fileExists(file, "home")) continue;
+    if (isRunningByFile(ns, file))    continue;          // still running from prior cycle
+    if (!withinRamBudget(ns, file, 1)) continue;         // budget cap respected
+    try { ns.exec(file, "home", 1); } catch (_) {}
+  }
 }
 
 async function cleanupDeprecated(ns) {
@@ -825,43 +830,9 @@ function findPath(ns, source, target) {
   return [];
 }
 
-async function buyToolsIfAffordable(ns) {
-  if (FLAGS.buyTor && !ns.hasTorRouter()) {
-    if (ns.getServerMoneyAvailable("home") >= 200_000) {
-      ns.singularity.purchaseTor();
-      ns.print("SUCCESS  Purchased TOR Router");
-    } else {
-      ns.print("WARN  TOR Router needs $200K");
-      return;
-    }
-  }
-
-  if (!FLAGS.buyPrograms) return;
-
-  const programs = [
-    { name: "BruteSSH.exe", cost: 500_000 },
-    { name: "FTPCrack.exe", cost: 1_500_000 },
-    { name: "relaySMTP.exe", cost: 5_000_000 },
-    { name: "HTTPWorm.exe", cost: 30_000_000 },
-    { name: "SQLInject.exe", cost: 250_000_000 },
-    { name: "ServerProfiler.exe", cost: 500_000 },
-    { name: "DeepscanV1.exe", cost: 500_000 },
-    { name: "DeepscanV2.exe", cost: 25_000_000 },
-    { name: "AutoLink.exe", cost: 1_000_000 },
-    { name: "Formulas.exe", cost: 5_000_000_000 }
-  ];
-
-  for (const prog of programs) {
-    if (ns.fileExists(prog.name, "home")) continue;
-
-    if (ns.getServerMoneyAvailable("home") >= prog.cost) {
-      ns.singularity.purchaseProgram(prog.name);
-      ns.print("SUCCESS  Purchased " + prog.name);
-    } else {
-      ns.print("WARN  " + pad(prog.name, 22) + " need $" + fmt(ns, prog.cost));
-    }
-  }
-}
+// buyToolsIfAffordable was inline through v12; v13 replaces it with a
+// spawn of /helpers/shop.js so scb.js no longer holds the singularity
+// namespace resident.
 
 function getAvailablePortCrackers(ns) {
   const crackers = [];
@@ -1025,253 +996,3 @@ function fmt(ns, n) {
   return String(n);
 }
 
-const UPGRADER_CODE = String.raw`
-/**
- * server-upgrader.js
- * UPGRADER_VERSION_12_SAVINGS_AWARE
- *
- * Fleet target scales with home RAM:
- *     target = clamp(START_RAM, cloudLimit, HOME_RAM_PCT * homeMaxRam)
- * snapped to the nearest lower power of 2.
- *
- * Each cycle the upgrader:
- *   1. Reads the savings policy from /Temp/economy.json (written by
- *      scb.js). While liquid cash < (minCashReserve + savingsTarget)
- *      ALL purchases and upgrades pause — the upgrader sleeps until
- *      cash recovers.
- *   2. Buys a fresh START_RAM pserv if a slot is open.
- *   3. Picks the smallest pserv below target and doubles its RAM
- *      (subject to the per-cycle cash-reserve guard).
- *
- * When home RAM grows the target lifts automatically — no restart.
- */
-
-/** @param {NS} ns */
-export async function main(ns) {
-  const ENABLED          = true;
-  const HOME_RAM_PCT     = 0.10;          // pserv cap = 10% of home max RAM
-  const RESERVE_MODE     = "percent";
-  const FIXED_RESERVE    = 500_000_000;
-  const PERCENT_RESERVE  = 10;
-  const CHECK_INTERVAL_MS = 30_000;
-  const MAX_SERVERS      = ns.cloud.getServerLimit();
-  const START_RAM_GB     = 8;
-  const SERVER_PREFIX    = "pserv-";
-  const TAIL_KEY         = "/Temp/server-upgrader-tail-open.txt";
-  const ECONOMY_FILE     = "/Temp/economy.json";
-
-  ns.disableLog("ALL");
-
-  const self = ns.getScriptName();
-  const running = ns.ps("home").filter((p) => p.filename === self);
-
-  if (running.length > 1) {
-    ns.print("WARN  Duplicate server-upgrader.js detected. Exiting.");
-    return;
-  }
-
-  if (!ns.fileExists(TAIL_KEY, "home")) {
-    ns.write(TAIL_KEY, "true", "w");
-    try {
-      ns.ui.openTail();
-    } catch {}
-  }
-
-  if (!ENABLED) {
-    ns.print("WARN  Server upgrader DISABLED");
-    return;
-  }
-
-  while (true) {
-    const owned   = ns.cloud.getServerNames();
-    const money   = ns.getServerMoneyAvailable("home");
-    const reserve = RESERVE_MODE === "percent"
-      ? money * (PERCENT_RESERVE / 100)
-      : FIXED_RESERVE;
-
-    // Savings lock: read economy.json (scb.js writes it). While
-    // cash < (minCashReserve + savingsTarget) we pause spending.
-    const econ = readEconomy(ns, ECONOMY_FILE);
-    const savingsThreshold = (econ.minCashReserve || 0) + (econ.savingsTarget || 0);
-    const savingsLocked = savingsThreshold > 0 && money < savingsThreshold;
-
-    const homeMax  = ns.getServerMaxRam("home");
-    const cloudCap = ns.cloud.getRamLimit();
-    const target   = computeTarget(homeMax, cloudCap, HOME_RAM_PCT, START_RAM_GB);
-
-    ns.print("─".repeat(48));
-    ns.print("INFO  Server Upgrader @ " + new Date().toLocaleTimeString());
-    ns.print("INFO  Owned: " + owned.length + "/" + MAX_SERVERS + " | Target: " + ns.format.ram(target) + " (10% of home " + ns.format.ram(homeMax) + ")");
-    ns.print("INFO  Cash: $" + ns.format.number(money) + " | Reserve: $" + ns.format.number(reserve) + " (" + RESERVE_MODE + ")");
-    ns.print("INFO  Spendable: $" + ns.format.number(Math.max(0, money - reserve)));
-    if (savingsLocked) {
-      ns.print("INFO  SAVINGS-LOCKED: cash $" + ns.format.number(money) + " < threshold $" + ns.format.number(savingsThreshold) + ". Skipping all purchases this cycle.");
-    }
-    ns.print("─".repeat(48));
-
-    if (savingsLocked) {
-      await ns.sleep(CHECK_INTERVAL_MS);
-      continue;
-    }
-
-    let bought = false;
-
-    // 1) buy a new pserv at START_RAM if slots remain
-    if (owned.length < MAX_SERVERS) {
-      const cost = ns.cloud.getServerCost(START_RAM_GB);
-
-      if (money - cost >= reserve) {
-        const name = nextServerName(owned, SERVER_PREFIX);
-        const result = ns.cloud.purchaseServer(name, START_RAM_GB);
-
-        if (result) {
-          ns.print("SUCCESS  Bought " + result + " (" + ns.format.ram(START_RAM_GB) + ")");
-          bought = true;
-        } else {
-          ns.print("ERROR  Purchase failed");
-        }
-      } else {
-        ns.print("WARN  New server ($" + ns.format.number(cost) + ") exceeds budget");
-      }
-    }
-
-    // 2) upgrade the smallest pserv below target — pick the cheapest
-    //    next-step. If we just bought a new one this cycle, skip the
-    //    upgrade pass to keep cash for more new pservs.
-    const refreshed = ns.cloud.getServerNames();
-    const upgradeable = refreshed
-      .map((srv) => ({ srv, ram: ns.getServerMaxRam(srv) }))
-      .filter((s) => s.ram < target)
-      .sort((a, b) => a.ram - b.ram);
-
-    if (!bought && upgradeable.length > 0) {
-      const pick    = upgradeable[0];
-      const nextRam = Math.min(target, pick.ram * 2);
-      const cost    = ns.cloud.getServerUpgradeCost(pick.srv, nextRam);
-      const cashNow = ns.getServerMoneyAvailable("home");
-      const reserveNow = RESERVE_MODE === "percent"
-        ? cashNow * (PERCENT_RESERVE / 100)
-        : FIXED_RESERVE;
-
-      if (cost < 0 || cost === Infinity) {
-        ns.print("WARN  " + pick.srv + " cannot compute upgrade cost");
-      } else if (cashNow - cost < reserveNow) {
-        // Couldn't afford the upgrade. If slots remain, falling back
-        // to buying a fresh START_RAM pserv on the next cycle is more
-        // useful than sitting idle — the cycle loop will handle it.
-        ns.print("WARN  " + pick.srv + " (" + ns.format.ram(pick.ram) + " -> " + ns.format.ram(nextRam) + ") $" + ns.format.number(cost) + " exceeds budget");
-      } else {
-        ns.killall(pick.srv);
-        const success = ns.cloud.upgradeServer(pick.srv, nextRam);
-        if (success) {
-          ns.print("SUCCESS  " + pick.srv + ": " + ns.format.ram(pick.ram) + " -> " + ns.format.ram(nextRam) + " $" + ns.format.number(cost));
-        } else {
-          ns.print("ERROR  Failed to upgrade " + pick.srv);
-        }
-      }
-    }
-
-    const finalOwned   = ns.cloud.getServerNames();
-    const belowTarget  = finalOwned.filter((srv) => ns.getServerMaxRam(srv) < target).length;
-
-    if (belowTarget === 0 && finalOwned.length >= MAX_SERVERS) {
-      ns.print("INFO  All " + finalOwned.length + " servers at " + ns.format.ram(target) + "+. Sleeping (will re-check after home RAM grows).");
-    } else if (belowTarget > 0) {
-      ns.print("INFO  " + belowTarget + " server(s) still below " + ns.format.ram(target));
-    }
-
-    await ns.sleep(CHECK_INTERVAL_MS);
-  }
-}
-
-function computeTarget(homeMax, cloudCap, pct, floorRam) {
-  const raw    = Math.min(cloudCap, Math.max(floorRam, homeMax * pct));
-  const exp    = Math.floor(Math.log2(Math.max(floorRam, raw)));
-  const snapped = Math.pow(2, exp);
-  return Math.max(floorRam, Math.min(snapped, cloudCap));
-}
-
-function readEconomy(ns, path) {
-  try {
-    if (!ns.fileExists(path, "home")) return {};
-    return JSON.parse(ns.read(path)) || {};
-  } catch (_) { return {}; }
-}
-
-function nextServerName(owned, prefix) {
-  let index = 0;
-  while (owned.includes(prefix + index)) index++;
-  return prefix + index;
-}
-`;
-
-const CONTRACTOR_CODE = String.raw`
-/**
- * contractor.js
- * CONTRACTOR_VERSION_1
- */
-
-/** @param {NS} ns */
-export async function main(ns) {
-  ns.disableLog("ALL");
-
-  while (true) {
-    const servers = deepScan(ns);
-    let found = 0;
-
-    for (const server of servers) {
-      const contracts = ns.ls(server, ".cct");
-
-      for (const contract of contracts) {
-        found++;
-        ns.print("INFO  Contract found: " + contract + " on " + server);
-      }
-    }
-
-    if (found > 0) {
-      ns.print("INFO  Contracts found this pass: " + found);
-    }
-
-    await ns.sleep(60_000);
-  }
-}
-
-function deepScan(ns) {
-  const visited = new Set();
-  const queue = ["home"];
-
-  while (queue.length > 0) {
-    const cur = queue.pop();
-
-    if (visited.has(cur)) continue;
-
-    visited.add(cur);
-
-    for (const n of ns.scan(cur)) {
-      if (!visited.has(n)) queue.push(n);
-    }
-  }
-
-  return [...visited];
-}
-`;
-
-const WATCHDOG_CODE = String.raw`
-/**
- * scb-watchdog.js
- * WATCHDOG_VERSION_2
- */
-
-/** @param {NS} ns */
-export async function main(ns) {
-  ns.disableLog("ALL");
-
-  const HEARTBEAT = "/Temp/scb-heartbeat.txt";
-  const INTERVAL = 10_000;
-
-  while (true) {
-    ns.write(HEARTBEAT, String(Date.now()), "w");
-    await ns.sleep(INTERVAL);
-  }
-}
-`;

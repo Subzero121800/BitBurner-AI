@@ -1,9 +1,36 @@
 /**
- * ollama-player.js — Autonomous Bitburner AI Player
- * PLAYER_VERSION_8_PROGRAM_COST_SAFE
+ * ollama-player.js — Autonomous Bitburner AI Player (slim caller)
+ * PLAYER_VERSION_10_FETCH_OFFLOAD
+ *
+ * As of v9 the player no longer imports a fat dispatcher. Every
+ * action is either:
+ *   - inline (noop/wait/set_*_plan; pure JS plus one cheap write), or
+ *   - routed by spawning a dispatcher under /ai/dispatch/<cat>.js,
+ *     which pays its own namespace RAM cost for the few hundred ms
+ *     it runs and then frees it.
+ *
+ * State that used to require the singularity / cloud namespaces in
+ * this file is now consumed as JSON snapshots written by the helpers
+ * in /ai/snap/. scb.js launches those snapshot scripts each cycle.
+ *
+ * Net effect: player static RAM drops from ~131 GB to ~6–8 GB.
+ * See README → "RAM cost & limiting in-game memory".
  */
 
-import { ACTION_SCHEMA, validateAction, executeAction } from "/ollama-actions.js";
+import { ACTION_SCHEMA, DISPATCH_MAP, INLINE_ACTIONS, validateAction } from "/ollama-actions.js";
+
+const REQ_FILE = "/Temp/ai-action-req.json";
+const RES_FILE = "/Temp/ai-action-res.json";
+
+// Snapshot files written by /ai/snap/*.js
+const NETWORK_SNAP     = "/Temp/network-state.json";
+const CLOUD_SNAP       = "/Temp/cloud-state.json";
+const PROGRESSION_SNAP = "/Temp/progression-state.json";
+
+// If a snapshot is older than this, the player triggers a refresh by
+// spawning the snap helper. The spawn cost is already in our budget;
+// the snap script's RAM only materialises during its run.
+const SNAP_STALE_MS = 90_000;
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -18,46 +45,41 @@ export async function main(ns) {
     pollInterval: 60_000,
     timeoutMs:    30_000
   });
-
-  // /Temp/ollama-host.txt is written by the local scb-watch daemon
-  // after probing localhost + the LAN candidates. If present and
-  // non-empty, it overrides whatever was passed in via config so the
-  // player always points at a reachable endpoint.
   config.ollamaHost = resolveOllamaHost(ns, config.ollamaHost);
 
   const safety = parseJsonArg(ns.args[1], {
-    maxActionsPerCycle: 5,
-    minCashReserve: 1_000_000,
-    minAugsToInstall: 5,
-    requireConfirmForReset: true,
-    blockedActions: ["soft_reset"],
-    logAllActions: true,
-    cashSpendCapPct: 90
+    maxActionsPerCycle:    5,
+    minCashReserve:        1_000_000,
+    minAugsToInstall:      5,
+    requireConfirmForReset:true,
+    blockedActions:        ["soft_reset"],
+    logAllActions:         true,
+    cashSpendCapPct:       90
   });
 
-  ns.print("INFO  Ollama Player v8 — backend: " + config.backend);
+  ns.print("INFO  Ollama Player v10 (fetch-offload) — backend: " + config.backend);
   ns.print("INFO  ollamaHost: " + config.ollamaHost);
   ns.print("INFO  poll: " + config.pollInterval + "ms | maxActions: " + safety.maxActionsPerCycle);
   appendLog(ns, safety, `START backend=${config.backend} host=${config.ollamaHost} model=${config.ollamaModel}`);
 
+  // Publish a state snapshot so scb.js's ensureCompanionFresh can
+  // version-bounce the player on disk-marker mismatch (same shape the
+  // companion managers use). Without this, ensureRunning would happily
+  // keep an old player alive across version bumps.
+  publishState(ns, config);
+
   while (true) {
     try {
-      // Re-resolve every cycle so the player follows a host coming
-      // online or going offline mid-session.
       config.ollamaHost = resolveOllamaHost(ns, config.ollamaHost);
+      ensureSnapshotsFresh(ns);
+      publishState(ns, config);
 
       const state = buildGameState(ns, safety);
-
-      // Self-context: feed the last N entries of our own action log
-      // back into the prompt so the model can see what it just did and
-      // avoid the "try the same forbidden upgrade 50 times in a row"
-      // failure mode. Both the window and the jam threshold are
-      // configurable via AI_CONFIG (recentLogLines / jamThreshold).
       const recent = readRecentLog(ns, Number(config.recentLogLines) || 30);
       state.recentActions = recent;
       state.jammedActions = recentlyJammedActions(recent, {
-        window:    Number(config.recentLogLines) || 30,
-        threshold: Number(config.jamThreshold)   || 3
+        windowSize: Number(config.recentLogLines) || 30,
+        threshold:  Number(config.jamThreshold)   || 3
       });
 
       const prompt = buildPrompt(state, safety);
@@ -67,12 +89,10 @@ export async function main(ns) {
       appendLog(ns, safety, `CYCLE money=${state.player.moneyFormatted} actions=${actions.length}`);
 
       let executed = 0;
-
       for (const action of actions) {
         if (executed >= safety.maxActionsPerCycle) break;
-
         const normalized = normalizeActionShape(action);
-        const repaired = repairAction(ns, normalized);
+        const repaired = repairAction(state, normalized);
 
         const safe = safetyCheck(ns, repaired, state, safety);
         if (!safe.ok) {
@@ -80,7 +100,6 @@ export async function main(ns) {
           appendLog(ns, safety, `SKIP  ${JSON.stringify(repaired)} => ${safe.reason}`);
           continue;
         }
-
         const valid = validateAction(repaired);
         if (!valid.ok) {
           ns.print("FAIL  " + JSON.stringify(repaired) + " => " + valid.reason);
@@ -88,35 +107,131 @@ export async function main(ns) {
           continue;
         }
 
-        const result = await executeAction(ns, repaired);
-
+        const result = await dispatch(ns, repaired);
         const tag = result.success ? "OK    " : "FAIL  ";
         ns.print(tag + JSON.stringify(repaired) + " => " + result.result);
         appendLog(ns, safety, `${tag.trim()}  ${JSON.stringify(repaired)} => ${result.result}`);
-
         executed++;
       }
     } catch (err) {
       ns.print("ERROR  AI cycle failed: " + String(err));
       appendLog(ns, safety, `ERROR  cycle threw: ${String(err)}`);
     }
-
     await ns.sleep(config.pollInterval || 60_000);
   }
 }
 
+// ─── action dispatch ────────────────────────────────────────────────
+//
+// Inline actions (noop, wait, set_*_plan) are handled here directly —
+// they don't justify the cost of a spawn round-trip. Everything else
+// is routed via DISPATCH_MAP to /ai/dispatch/<cat>.js, spawned with
+// the action object on /Temp/ai-action-req.json. The helper writes
+// /Temp/ai-action-res.json and exits; we poll for it.
+async function dispatch(ns, action) {
+  if (INLINE_ACTIONS.has(action.action)) return runInline(ns, action);
+
+  const cat = DISPATCH_MAP[action.action];
+  if (!cat) return { success: false, result: "no dispatcher for " + action.action };
+
+  const file = `/ai/dispatch/${cat}.js`;
+  if (!ns.fileExists(file, "home")) {
+    return { success: false, result: "dispatcher missing: " + file + " — run scb.js to repopulate" };
+  }
+
+  const reqId = String(Date.now()) + "-" + Math.floor(Math.random() * 1e6);
+  const payload = { ...action, _reqId: reqId };
+  ns.write(REQ_FILE, JSON.stringify(payload), "w");
+
+  const pid = ns.exec(file, "home", 1);
+  if (pid <= 0) return { success: false, result: `exec ${file} failed (RAM?)` };
+
+  // Most dispatchers complete in well under 1s. backdoor + commit_crime
+  // can take a few seconds; install_augmentations resets the game and
+  // the result file may never land. 30s ceiling is plenty.
+  for (let i = 0; i < 300; i++) {
+    if (ns.fileExists(RES_FILE, "home")) {
+      try {
+        const parsed = JSON.parse(ns.read(RES_FILE) || "");
+        if (parsed && parsed._reqId === reqId) return parsed;
+      } catch (_) {}
+    }
+    await ns.sleep(100);
+  }
+  return { success: false, result: `dispatcher timeout (30s) on ${file}` };
+}
+
+function runInline(ns, action) {
+  switch (action.action) {
+    case "noop":
+      return { success: true, result: "no-op" };
+    case "wait":
+      return { success: true, result: "wait acknowledged " + (Number(action.ms) || 0) + "ms" };
+    case "set_sleeve_plan":
+      return setDirective(ns, "/Temp/sleeve-directives.json", action.plan, "sleeve");
+    case "set_gang_plan":
+      return setDirective(ns, "/Temp/gang-directives.json", action.plan, "gang");
+    case "set_bladeburner_plan":
+      return setDirective(ns, "/Temp/bladeburner-directives.json", action.plan, "bladeburner");
+    default:
+      return { success: false, result: "inline: unhandled " + action.action };
+  }
+}
+
+function setDirective(ns, path, plan, kind) {
+  if (!plan || typeof plan !== "object" || Array.isArray(plan)) {
+    return { success: false, result: kind + " plan must be a JSON object" };
+  }
+  const wrapped = { ...plan, ts: Date.now() };
+  const body = JSON.stringify(wrapped, null, 2);
+  if (body.length > 50_000) return { success: false, result: kind + " plan > 50 KB, refused" };
+  try {
+    ns.write(path, body, "w");
+    return { success: true, result: "wrote " + kind + " directive (" + body.length + " B) to " + path };
+  } catch (e) {
+    return { success: false, result: "set_" + kind + "_plan threw: " + String(e.message || e) };
+  }
+}
+
+// ─── snapshot bootstrap ─────────────────────────────────────────────
+// scb.js runs the snap helpers each cycle, but on first launch (or
+// after a watchdog bounce) the snapshots may be missing or stale. If
+// so, we spawn the helper and let the next cycle pick up its output.
+function ensureSnapshotsFresh(ns) {
+  const snaps = [
+    ["/ai/snap/network.js",     NETWORK_SNAP],
+    ["/ai/snap/cloud.js",       CLOUD_SNAP],
+    ["/ai/snap/progression.js", PROGRESSION_SNAP]
+  ];
+  for (const [helper, output] of snaps) {
+    if (!ns.fileExists(helper, "home")) continue;
+    let stale = true;
+    try {
+      if (ns.fileExists(output, "home")) {
+        const ts = (JSON.parse(ns.read(output)) || {}).ts || 0;
+        stale = (Date.now() - ts) > SNAP_STALE_MS;
+      }
+    } catch (_) {}
+    if (stale) {
+      try { ns.exec(helper, "home", 1); } catch (_) {}
+    }
+  }
+}
+
+// ─── game state assembly ────────────────────────────────────────────
 function buildGameState(ns, safety) {
   const player = ns.getPlayer();
   const money = ns.getServerMoneyAvailable("home");
-  const workers = getWorkerCapacity(ns);
+  const network = readJson(ns, NETWORK_SNAP) || { totalServers: 0, rootedServers: 0, rooted: [], targets: [] };
+  const cloud   = readJson(ns, CLOUD_SNAP)   || { serverFleet: { ownedCount: 0, limit: 0, atLimit: false, maxRamLimit: 0, validUpgrades: [] },
+                                                  purchasedServers: [], workers: { totalFreeRam: 0, minHackRam: 8, bestServer: null, servers: [] } };
+  const progression = readJson(ns, PROGRESSION_SNAP) || {
+    pendingAugs: 0, installedAugs: 0, installReady: false,
+    pendingInvites: [], affordableAugs: [], factionsWithRep: []
+  };
+
   const programs = getOwnedPrograms(ns);
-  const servers = scanAll(ns);
-  const rooted = servers.filter((s) => ns.hasRootAccess(s));
-  const targets = getTargets(ns, servers);
-  const purchased = ns.cloud.getServerNames();
-  const serverLimit = ns.cloud.getServerLimit();
-  const atLimit = purchased.length >= serverLimit;
-  const upgrades = getValidServerUpgrades(ns, money, safety);
+  const missing  = getMissingPrograms(ns);
 
   return {
     time: new Date().toISOString(),
@@ -135,70 +250,39 @@ function buildGameState(ns, safety) {
       spendableCash: Math.max(0, money - safety.minCashReserve)
     },
 
-    // Savings policy: while liquid cash is below
-    // (minCashReserve + savingsTarget), discretionary spending is
-    // locked. Only income-generating actions (deploy_hack, work_*,
-    // commit_crime, study, gym, hacknet income) are useful.
     savings: {
-      target:   Number(safety.savingsTarget || 0),
-      floor:    Number(safety.minCashReserve || 0),
+      target:    Number(safety.savingsTarget || 0),
+      floor:     Number(safety.minCashReserve || 0),
       threshold: Number(safety.minCashReserve || 0) + Number(safety.savingsTarget || 0),
-      cash:     money,
-      shortBy:  Math.max(0, (Number(safety.minCashReserve || 0) + Number(safety.savingsTarget || 0)) - money),
-      unlocked: money >= (Number(safety.minCashReserve || 0) + Number(safety.savingsTarget || 0))
+      cash:      money,
+      shortBy:   Math.max(0, (Number(safety.minCashReserve || 0) + Number(safety.savingsTarget || 0)) - money),
+      unlocked:  money >= (Number(safety.minCashReserve || 0) + Number(safety.savingsTarget || 0))
     },
 
-    // System health — surfaces sync staleness so the AI can decide
-    // to call reconnect_remote_api when the host can no longer
-    // deliver fresh code. Heartbeat is written by scb-watch every 2s
-    // and stops updating when the WS to the game drops.
     systemHealth: getSystemHealth(ns),
+    budget:       getBudget(ns),
 
-    // RAM budget — read from /Temp/economy.json (scb.js owns the
-    // policy). When budgetRemainingGB drops to ~0 the AI should
-    // avoid actions that spawn more home-side scripts.
-    budget: getBudget(ns),
-
-    // Manager state — what the autonomous companions are doing right
-    // now. Each manager publishes a JSON snapshot every cycle. The
-    // AI can steer them via set_sleeve_plan / set_gang_plan /
-    // set_bladeburner_plan. null entries mean the companion isn't
-    // running (or its SF isn't unlocked).
     managers: {
       sleeve:      readJson(ns, "/Temp/sleeve-state.json"),
       gang:        readJson(ns, "/Temp/gang-state.json"),
       bladeburner: readJson(ns, "/Temp/bladeburner-state.json")
     },
 
-    serverFleet: {
-      ownedCount: purchased.length,
-      limit: serverLimit,
-      atLimit,
-      maxRamLimit: ns.cloud.getRamLimit(),
-      validUpgrades: upgrades
-    },
+    serverFleet:      cloud.serverFleet,
+    purchasedServers: cloud.purchasedServers,
+    workers:          cloud.workers,
 
-    programs: {
-      owned: programs,
-      missing: getMissingPrograms(ns)
-    },
+    programs:     { owned: programs, missing },
+    progression,
 
     network: {
-      totalServers: servers.length,
-      rootedServers: rooted.length,
-      rooted: rooted.slice(0, 50)
+      totalServers:  network.totalServers,
+      rootedServers: network.rootedServers,
+      rooted:        network.rooted
     },
+    targets: network.targets,
 
-    purchasedServers: purchased.map((s) => ({
-      name: s,
-      maxRam: ns.getServerMaxRam(s),
-      usedRam: ns.getServerUsedRam(s),
-      freeRam: freeRam(ns, s)
-    })),
-
-    workers,
-    targets,
-    recommendations: buildRecommendations(ns, workers, targets, programs, money, safety),
+    recommendations: buildRecommendations(cloud, network, missing, money, safety),
 
     rules: [
       "Return only raw JSON. No markdown. No explanation.",
@@ -222,63 +306,39 @@ function buildGameState(ns, safety) {
   };
 }
 
-function buildRecommendations(ns, workers, targets, programs, money, safety) {
-  const recommendations = [];
+function buildRecommendations(cloud, network, missing, money, safety) {
+  const recs = [];
+  const fleet = cloud.serverFleet || { atLimit: false, validUpgrades: [] };
+  const workers = cloud.workers || { totalFreeRam: 0, minHackRam: 8, bestServer: null };
 
-  const missing = getMissingPrograms(ns);
-  const affordableProgram = missing.find((p) => money - p.cost >= safety.minCashReserve);
-
-  if (affordableProgram) {
-    recommendations.push({
-      action: "buy_program",
-      program: affordableProgram.name,
-      reason: "Affordable missing hacking program"
-    });
+  const affordable = (missing || []).find((p) => money - p.cost >= safety.minCashReserve);
+  if (affordable) {
+    recs.push({ action: "buy_program", program: affordable.name, reason: "Affordable missing hacking program" });
   }
-
-  const owned = ns.cloud.getServerNames();
-  const serverLimit = ns.cloud.getServerLimit();
-  const atLimit = owned.length >= serverLimit;
 
   if (workers.totalFreeRam < workers.minHackRam) {
-    if (!atLimit) {
-      recommendations.push({
-        action: "buy_server",
-        ram: 8,
-        reason: "No free worker RAM available and server slots remain"
+    if (!fleet.atLimit) {
+      recs.push({ action: "buy_server", ram: 8, reason: "No free worker RAM available and server slots remain" });
+    }
+    const up = (fleet.validUpgrades || [])[0];
+    if (up) {
+      recs.push({
+        action: "upgrade_server", server: up.server, ram: up.nextRam,
+        reason: fleet.atLimit ? "Server limit reached. Upgrade existing server." : "Increase worker RAM"
       });
     }
-
-    const upgrade = pickServerUpgrade(ns, money, safety);
-    if (upgrade) {
-      recommendations.push({
-        action: "upgrade_server",
-        server: upgrade.server,
-        ram: upgrade.nextRam,
-        reason: atLimit ? "Server limit reached. Upgrade existing server." : "Increase worker RAM"
-      });
-    }
-
-    recommendations.push({
-      action: "noop",
-      reason: "RAM is full or constrained. Avoid failed deploy actions."
-    });
-
-    return recommendations;
+    recs.push({ action: "noop", reason: "RAM is full or constrained. Avoid failed deploy actions." });
+    return recs;
   }
 
-  const target = targets[0]?.name || "n00dles";
-
+  const target = (network.targets && network.targets[0]?.name) || "n00dles";
   if (workers.bestServer) {
-    recommendations.push({
-      action: "deploy_hack",
-      target,
-      server: workers.bestServer,
+    recs.push({
+      action: "deploy_hack", target, server: workers.bestServer,
       reason: "Best target and available worker RAM"
     });
   }
-
-  return recommendations;
+  return recs;
 }
 
 function buildPrompt(state, safety) {
@@ -308,6 +368,13 @@ function buildPrompt(state, safety) {
     "- If you see the same action succeed and you'd repeat it, only do so if the context has actually changed (e.g. a new server became available).",
     "- If you see a pattern in your log that looks like a code-level bug (the orchestrator or action library doing the wrong thing repeatedly), use read_file to inspect /ollama-actions.js or /ollama-player.js, then emit a propose_patch action so a human can review the fix. Do not write_generated_script in place of fixing core code; protected files require propose_patch.",
     "- You can also write helpful one-off helper scripts under /ai/generated/ via write_generated_script and run them via run_script if a specific automation would unblock you.",
+    "",
+    "Progression policy (avoid noop-spamming once income saturates):",
+    "- state.progression.pendingInvites lists factions you have NOT joined yet. For each, emit join_faction immediately — there is no downside.",
+    "- state.progression.affordableAugs lists augs you can buy RIGHT NOW from factions you've already joined (rep + cash both met). When this array is non-empty AND state.savings.unlocked is true, prefer buy_augmentation over noop. Use the {faction, aug} pair verbatim.",
+    "- state.progression.installReady is true when you have ≥ 5 queued augs. When installReady is true and state.progression.affordableAugs is empty (or you've bought what you can), emit install_augmentations to lock in your gains and reset.",
+    "- state.progression.factionsWithRep[].nextAugRepGap is the rep delta to the next aug. If it's small (< 25k) and you have nothing else to buy, work_faction with that faction to close the gap — don't sit idle.",
+    "- noop is only acceptable when ALL of: savings unlocked is false, RAM is full, no affordable augs, no pending invites, no faction with a small rep gap, and recentActions shows the same income-action already in flight. Otherwise pick something concrete.",
     "",
     "Savings policy (READ THIS):",
     "- state.savings.threshold = minCashReserve + savingsTarget. While state.savings.unlocked == false, all discretionary spending is blocked server-side: buy_program, buy_server, upgrade_server, buy_augmentation, donate_faction will all be rejected with SAVINGS-LOCKED.",
@@ -358,6 +425,7 @@ function buildPrompt(state, safety) {
   ].join("\n");
 }
 
+// ─── AI backend ─────────────────────────────────────────────────────
 async function askAI(ns, config, prompt) {
   if (config.backend === "ollama") return parseActions(await askOllama(ns, config, prompt));
   if (config.backend === "claude") return parseActions(await askClaudeBridge(ns, config, prompt));
@@ -366,8 +434,7 @@ async function askAI(ns, config, prompt) {
 
 async function askOllama(ns, config, prompt) {
   const url = trimSlash(config.ollamaHost) + "/api/generate";
-
-  const body = {
+  const body = JSON.stringify({
     model: config.ollamaModel,
     prompt,
     stream: false,
@@ -375,103 +442,119 @@ async function askOllama(ns, config, prompt) {
       temperature: typeof config.temperature === "number" ? config.temperature : 0.2,
       num_ctx:     typeof config.numCtx       === "number" ? config.numCtx       : 8192
     }
-  };
-
+  });
   try {
-    const response = await fetchWithTimeout(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    }, config.timeoutMs || 30_000);
-
-    const data = await response.json();
+    const result = await postViaHelper(ns, url, body, config.timeoutMs || 30_000);
+    if (!result.ok) {
+      ns.print("WARN  ai-fetch error: " + (result.error || ("status " + result.status)));
+      return "";
+    }
+    const data = JSON.parse(result.text || "{}");
     return data.response || "";
   } catch (err) {
-    ns.print("WARN  fetch failed (" + String(err) + ") — trying ns.wget fallback");
-    return await wgetFallback(ns, url, body);
+    ns.print("WARN  askOllama threw: " + String(err));
+    return "";
   }
 }
 
 async function askClaudeBridge(ns, config, prompt) {
   const url = trimSlash(config.claudeHost);
-
-  const body = {
-    model: config.claudeModel,
-    prompt
-  };
-
+  const body = JSON.stringify({ model: config.claudeModel, prompt });
   try {
-    const response = await fetchWithTimeout(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    }, config.timeoutMs || 30_000);
-
-    const data = await response.json();
+    const result = await postViaHelper(ns, url, body, config.timeoutMs || 30_000);
+    if (!result.ok) {
+      ns.print("WARN  ai-fetch error: " + (result.error || ("status " + result.status)));
+      return "";
+    }
+    const data = JSON.parse(result.text || "{}");
     return data.text || data.response || "";
   } catch (err) {
-    ns.print("WARN  fetch failed (" + String(err) + ") — trying ns.wget fallback");
-    return await wgetFallback(ns, url, body);
-  }
-}
-
-async function wgetFallback(ns, url, body) {
-  const file = "/Temp/ai-response.txt";
-  const payload = "data:application/json," + encodeURIComponent(JSON.stringify(body));
-
-  try {
-    await ns.wget(payload, file);
-    return ns.read(file) || "";
-  } catch {
+    ns.print("WARN  askClaudeBridge threw: " + String(err));
     return "";
   }
 }
 
+// Routes the HTTP call through /helpers/ai-fetch.js so the resident
+// player doesn't carry the global fetch / AbortController RAM cost
+// (~25 GB in modern Bitburner). The helper materialises that cost
+// only for the duration of the round-trip and then frees it.
+async function postViaHelper(ns, url, body, timeoutMs) {
+  const helper = "/helpers/ai-fetch.js";
+  if (!ns.fileExists(helper, "home")) {
+    return { ok: false, error: "missing " + helper + " — sync the helpers/ dir from the repo" };
+  }
+  const reqId = String(Date.now()) + "-" + Math.floor(Math.random() * 1e6);
+  const REQ = "/Temp/ai-fetch-req.json";
+  const RES = "/Temp/ai-fetch-res.json";
+
+  ns.write(REQ, JSON.stringify({
+    _reqId: reqId,
+    url,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    timeoutMs
+  }), "w");
+
+  const pid = ns.exec(helper, "home", 1);
+  if (pid <= 0) return { ok: false, error: "ai-fetch exec failed (RAM?)" };
+
+  // Poll for the matching response. Worst case we wait timeoutMs+5s.
+  const ceiling = (timeoutMs || 30_000) + 5_000;
+  const slices  = Math.max(10, Math.ceil(ceiling / 200));
+  for (let i = 0; i < slices; i++) {
+    if (ns.fileExists(RES, "home")) {
+      try {
+        const parsed = JSON.parse(ns.read(RES) || "");
+        if (parsed && parsed._reqId === reqId) return parsed;
+      } catch (_) {}
+    }
+    await ns.sleep(200);
+  }
+  return { ok: false, error: "ai-fetch timeout (" + ceiling + "ms)" };
+}
+
 function parseActions(raw) {
   if (!raw || typeof raw !== "string") return [];
-
   let text = raw.trim()
     .replace(/^```json/i, "")
     .replace(/^```/i, "")
     .replace(/```$/i, "")
     .trim();
-
   const firstArray = text.indexOf("[");
-  const lastArray = text.lastIndexOf("]");
-
+  const lastArray  = text.lastIndexOf("]");
   if (firstArray >= 0 && lastArray > firstArray) {
     text = text.slice(firstArray, lastArray + 1);
   } else {
     const firstObject = text.indexOf("{");
-    const lastObject = text.lastIndexOf("}");
-
-    if (firstObject >= 0 && lastObject > firstObject) {
-      text = "[" + text.slice(firstObject, lastObject + 1) + "]";
-    }
+    const lastObject  = text.lastIndexOf("}");
+    if (firstObject >= 0 && lastObject > firstObject) text = "[" + text.slice(firstObject, lastObject + 1) + "]";
   }
-
   try {
     const parsed = JSON.parse(text);
     if (Array.isArray(parsed)) return parsed.filter((x) => x && typeof x === "object");
     if (parsed && typeof parsed === "object") return [parsed];
     return [];
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
 function normalizeActionShape(action) {
   if (!action || typeof action !== "object") return action;
-
   const normalized = { ...action };
+  if (action.args && typeof action.args === "object" && !Array.isArray(action.args)) {
+    for (const [k, v] of Object.entries(action.args)) {
+      if (k === "action") continue;
+      if (normalized[k] === undefined) normalized[k] = v;
+    }
+    delete normalized.args;
+    return normalized;
+  }
   if (!Array.isArray(action.args)) return normalized;
-
   const args = action.args;
-
   if (action.action === "buy_server" && normalized.ram === undefined) normalized.ram = args[0];
   if (action.action === "upgrade_server") {
     if (normalized.server === undefined) normalized.server = args[0];
-    if (normalized.ram === undefined) normalized.ram = args[1];
+    if (normalized.ram === undefined)    normalized.ram    = args[1];
   }
   if (action.action === "deploy_hack") {
     if (normalized.target === undefined) normalized.target = args[0];
@@ -479,21 +562,19 @@ function normalizeActionShape(action) {
   }
   if (["hack", "grow", "weaken"].includes(action.action) && normalized.target === undefined) normalized.target = args[0];
   if (action.action === "buy_program" && normalized.program === undefined) normalized.program = args[0];
-
   delete normalized.args;
   return normalized;
 }
 
-function repairAction(ns, action) {
+// repairAction now takes the snapshot-based state instead of calling the cloud namespace directly.
+function repairAction(state, action) {
   if (!action || typeof action !== "object") return action;
-
   const fixed = { ...action };
-
   if (fixed.action === "upgrade_server" && fixed.server) {
-    const upgrade = getValidUpgradeForServer(ns, fixed.server);
-    if (upgrade) fixed.ram = upgrade.nextRam;
+    const valid = state.serverFleet?.validUpgrades || [];
+    const match = valid.find((u) => u.server === fixed.server);
+    if (match) fixed.ram = match.nextRam;
   }
-
   return fixed;
 }
 
@@ -504,17 +585,9 @@ function safetyCheck(ns, action, state, safety) {
     return { ok: false, reason: "blocked action: " + action.action };
   }
 
-  // Server-side jam suppression: even if the AI ignores the prompt
-  // rules, we won't let it spam the same failing action 50× in a row.
-  // state.jammedActions was computed from the recent log earlier this
-  // cycle. If the proposed action matches a jammed signature, reject
-  // with a clear "REPEAT-SUPPRESSED" reason that goes back into the
-  // log and shows up in the next cycle's recentActions for the AI.
   if (Array.isArray(state.jammedActions) && state.jammedActions.length) {
     const sig = JSON.stringify(action);
     for (const j of state.jammedActions) {
-      // j.sig is `{...action json...} :: <reason>` — match on the
-      // action JSON prefix only, since the reason changes by run.
       const actionPart = j.sig.split(" :: ")[0];
       if (actionPart === sig) {
         return { ok: false, reason: "REPEAT-SUPPRESSED (" + j.count + "x): identical action just failed — try a different approach" };
@@ -522,10 +595,6 @@ function safetyCheck(ns, action, state, safety) {
     }
   }
 
-  // Savings lock: while liquid cash hasn't crossed
-  // (minCashReserve + savingsTarget), block discretionary spend
-  // actions. Income-generating actions (deploy_hack, work_*,
-  // commit_crime, study, gym, hacknet, etc.) still pass through.
   if (state.savings && state.savings.target > 0 && !state.savings.unlocked) {
     const DISCRETIONARY = new Set([
       "buy_program", "buy_server", "upgrade_server",
@@ -544,23 +613,14 @@ function safetyCheck(ns, action, state, safety) {
 
   if (action.action === "buy_program") {
     if (!action.program) return { ok: false, reason: "missing program" };
-
     if (state.programs.owned.includes(action.program)) {
       return { ok: false, reason: action.program + " already owned" };
     }
-
     const program = PROGRAMS.find((p) => p.name === action.program);
     if (!program) return { ok: false, reason: "unknown program" };
-
     const money = ns.getServerMoneyAvailable("home");
-
-    if (money < program.cost) {
-      return { ok: false, reason: "insufficient funds for " + action.program };
-    }
-
-    if (money - program.cost < safety.minCashReserve) {
-      return { ok: false, reason: "purchase violates cash reserve" };
-    }
+    if (money < program.cost) return { ok: false, reason: "insufficient funds for " + action.program };
+    if (money - program.cost < safety.minCashReserve) return { ok: false, reason: "purchase violates cash reserve" };
   }
 
   if (["hack", "grow", "weaken", "deploy_hack"].includes(action.action)) {
@@ -570,45 +630,23 @@ function safetyCheck(ns, action, state, safety) {
   }
 
   if (action.action === "buy_server") {
-    const owned = ns.cloud.getServerNames().length;
-    const limit = ns.cloud.getServerLimit();
-
-    if (owned >= limit) return { ok: false, reason: "server limit reached. Use upgrade_server instead." };
-
-    const ram = sanitizeRam(Number(action.ram || 8));
-    const cost = ns.cloud.getServerCost(ram);
-    const cash = ns.getServerMoneyAvailable("home");
-
-    if (cash - cost < safety.minCashReserve) {
-      return { ok: false, reason: "buy_server would violate cash reserve" };
-    }
+    if (state.serverFleet.atLimit) return { ok: false, reason: "server limit reached. Use upgrade_server instead." };
+    // Cost gating happens inside the dispatcher with live values; here we only
+    // gate on snapshot data so the dispatcher isn't even spawned for a clear no.
   }
 
   if (action.action === "upgrade_server") {
     if (!action.server) return { ok: false, reason: "missing server" };
-
-    const current = ns.getServerMaxRam(action.server);
-    let ram = sanitizeRam(Number(action.ram || 0));
-
-    if (ram <= current) ram = current * 2;
-    ram = Math.min(ram, ns.cloud.getRamLimit());
-
-    const cost = ram > current ? ns.cloud.getServerUpgradeCost(action.server, ram) : Infinity;
-
-    if (cost < 0 || cost === Infinity) return { ok: false, reason: "invalid upgrade cost" };
-
-    const cash = ns.getServerMoneyAvailable("home");
-
-    if (cash - cost < safety.minCashReserve) {
+    const valid = (state.serverFleet.validUpgrades || []).find((u) => u.server === action.server);
+    if (!valid) return { ok: false, reason: "no valid upgrade for " + action.server + " in current fleet snapshot" };
+    const money = ns.getServerMoneyAvailable("home");
+    if (money - valid.cost < safety.minCashReserve) {
       return { ok: false, reason: "upgrade_server would violate cash reserve" };
     }
   }
 
   if (action.action === "install_augmentations" && safety.requireConfirmForReset) {
-    const queued = ns.singularity.getOwnedAugmentations(true).length;
-    const owned = ns.singularity.getOwnedAugmentations(false).length;
-    const pending = queued - owned;
-
+    const pending = state.progression?.pendingAugs || 0;
     if (pending < safety.minAugsToInstall) {
       return { ok: false, reason: "not enough pending augmentations" };
     }
@@ -617,70 +655,9 @@ function safetyCheck(ns, action, state, safety) {
   return { ok: true };
 }
 
-function getWorkerCapacity(ns) {
-  const servers = [...new Set([...ns.cloud.getServerNames(), "home"])];
-
-  const rows = servers.map((s) => {
-    const maxRam = ns.getServerMaxRam(s);
-    const usedRam = ns.getServerUsedRam(s);
-    const reserve = s === "home" ? 256 : 0;
-    const free = Math.max(0, maxRam - usedRam - reserve);
-
-    return { server: s, maxRam, usedRam, reserve, freeRam: free };
-  });
-
-  const ranked = [...rows].sort((a, b) => b.freeRam - a.freeRam || b.maxRam - a.maxRam);
-  const totalFreeRam = rows.reduce((sum, r) => sum + r.freeRam, 0);
-
-  return {
-    totalFreeRam,
-    totalFreeRamFormatted: ns.format.ram(totalFreeRam),
-    minHackRam: 8,
-    bestServer: ranked[0]?.freeRam >= 8 ? ranked[0].server : null,
-    servers: ranked
-  };
-}
-
-function getTargets(ns, servers) {
-  const player = ns.getPlayer();
-
-  return servers
-    .filter((s) => s !== "home")
-    .filter((s) => !s.startsWith("hacknet"))
-    .filter((s) => !s.startsWith("pserv"))
-    .filter((s) => !s.startsWith("ai-pserv"))
-    .filter((s) => ns.hasRootAccess(s))
-    .filter((s) => ns.getServerMaxMoney(s) > 0)
-    .filter((s) => ns.getServerRequiredHackingLevel(s) <= player.skills.hacking)
-    .map((s) => {
-      const maxMoney = ns.getServerMaxMoney(s);
-      const money = ns.getServerMoneyAvailable(s);
-      const minSec = ns.getServerMinSecurityLevel(s);
-      const sec = ns.getServerSecurityLevel(s);
-      const score = maxMoney / Math.max(1, minSec);
-
-      return {
-        name: s,
-        maxMoney,
-        money,
-        moneyRatio: maxMoney > 0 ? money / maxMoney : 0,
-        minSecurity: minSec,
-        security: sec,
-        requiredHacking: ns.getServerRequiredHackingLevel(s),
-        score
-      };
-    })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 15);
-}
-
-function getOwnedPrograms(ns) {
-  return PROGRAMS.filter((p) => ns.fileExists(p.name, "home")).map((p) => p.name);
-}
-
-function getMissingPrograms(ns) {
-  return PROGRAMS.filter((p) => !ns.fileExists(p.name, "home"));
-}
+// ─── helpers ────────────────────────────────────────────────────────
+function getOwnedPrograms(ns)   { return PROGRAMS.filter((p) =>  ns.fileExists(p.name, "home")).map((p) => p.name); }
+function getMissingPrograms(ns) { return PROGRAMS.filter((p) => !ns.fileExists(p.name, "home")); }
 
 const PROGRAMS = [
   { name: "BruteSSH.exe", cost: 500_000 },
@@ -695,112 +672,20 @@ const PROGRAMS = [
   { name: "Formulas.exe", cost: 5_000_000_000 }
 ];
 
-function getValidServerUpgrades(ns, money, safety) {
-  let owned;
-  try { owned = ns.cloud.getServerNames(); }
-  catch (_) { return []; }
-  const maxRam = ns.cloud.getRamLimit();
-
-  return owned
-    .map((server) => {
-      try {
-        const current = ns.getServerMaxRam(server);
-        const nextRam = Math.min(current * 2, maxRam);
-        const cost = nextRam > current ? ns.cloud.getServerUpgradeCost(server, nextRam) : Infinity;
-        return { server, current, nextRam, cost };
-      } catch (_) {
-        return null;
-      }
-    })
-    .filter((x) => x && x.nextRam > x.current)
-    .filter((x) => x.cost > 0 && x.cost !== Infinity)
-    .filter((x) => money - x.cost >= safety.minCashReserve)
-    .sort((a, b) => a.cost - b.cost)
-    .slice(0, 10);
-}
-
-function getValidUpgradeForServer(ns, server) {
-  // The model can hallucinate purchased-server names (e.g. propose
-  // pserv-19 when only pserv-0..N exist). getServerMaxRam throws
-  // hard on a bad host, which used to take the entire cycle down.
-  // Verify the server is in the cloud-owned set first.
-  if (!server) return null;
-  let owned;
-  try { owned = ns.cloud.getServerNames(); }
-  catch (_) { return null; }
-  if (!owned.includes(server)) return null;
-
-  const maxRam  = ns.cloud.getRamLimit();
-  let current;
-  try { current = ns.getServerMaxRam(server); }
-  catch (_) { return null; }
-  const nextRam = Math.min(current * 2, maxRam);
-  if (nextRam <= current) return null;
-
-  let cost;
-  try { cost = ns.cloud.getServerUpgradeCost(server, nextRam); }
-  catch (_) { return null; }
-  if (cost < 0 || cost === Infinity) return null;
-
-  return { server, current, nextRam, cost };
-}
-
-function pickServerUpgrade(ns, money, safety) {
-  const candidates = getValidServerUpgrades(ns, money, safety);
-  return candidates[0] || null;
-}
-
-function scanAll(ns) {
-  const visited = new Set();
-  const queue = ["home"];
-
-  while (queue.length > 0) {
-    const current = queue.pop();
-    if (visited.has(current)) continue;
-
-    visited.add(current);
-
-    for (const next of ns.scan(current)) {
-      if (!visited.has(next)) queue.push(next);
-    }
-  }
-
-  return [...visited];
-}
-
-function sanitizeRam(value) {
-  let ram = Number(value || 8);
-  if (!Number.isFinite(ram) || ram < 8) ram = 8;
-  return Math.max(8, Math.pow(2, Math.floor(Math.log2(ram))));
-}
-
 function parseJsonArg(raw, fallback) {
   if (!raw) return fallback;
-
-  try {
-    return { ...fallback, ...JSON.parse(String(raw)) };
-  } catch {
-    return fallback;
-  }
+  try { return { ...fallback, ...JSON.parse(String(raw)) }; }
+  catch { return fallback; }
 }
 
-function trimSlash(value) {
-  return String(value || "").replace(/\/+$/, "");
-}
+function trimSlash(value) { return String(value || "").replace(/\/+$/, ""); }
 
 function resolveOllamaHost(ns, fallback) {
-  // The local scb-watch daemon writes /Temp/ollama-host.txt with the
-  // first reachable Ollama endpoint (localhost or LAN). Use it if
-  // present and non-empty; otherwise stick with the fallback baked
-  // into config (or whatever the previous cycle resolved to).
   try {
     if (!ns.fileExists("/Temp/ollama-host.txt", "home")) return fallback;
     const detected = String(ns.read("/Temp/ollama-host.txt") || "").trim();
-    if (!detected) return fallback;
-    return detected;
-  } catch (_) {
-    return fallback;
-  }
+    return detected || fallback;
+  } catch (_) { return fallback; }
 }
 
 function readJson(ns, path) {
@@ -810,6 +695,18 @@ function readJson(ns, path) {
   } catch (_) { return null; }
 }
 
+function publishState(ns, config) {
+  try {
+    ns.write("/Temp/ollama-player-state.json", JSON.stringify({
+      ts: Date.now(),
+      version:    "PLAYER_VERSION_10_FETCH_OFFLOAD",
+      backend:    config.backend,
+      ollamaHost: config.ollamaHost,
+      model:      config.backend === "claude" ? config.claudeModel : config.ollamaModel
+    }, null, 2), "w");
+  } catch (_) {}
+}
+
 function getBudget(ns) {
   try {
     if (!ns.fileExists("/Temp/economy.json", "home")) return null;
@@ -817,7 +714,7 @@ function getBudget(ns) {
     return {
       maxInGameRamGB:    econ.maxInGameRamGB || 0,
       managedRamGB:      econ.managedRamGB || 0,
-      budgetRemainingGB: econ.budgetRemainingGB,         // null if unlimited
+      budgetRemainingGB: econ.budgetRemainingGB,
       capped:            (econ.maxInGameRamGB || 0) > 0,
       tight:             (econ.maxInGameRamGB || 0) > 0 &&
                          (econ.budgetRemainingGB ?? Infinity) < 4
@@ -826,11 +723,6 @@ function getBudget(ns) {
 }
 
 function getSystemHealth(ns) {
-  // /Temp/scb-heartbeat.txt is rewritten by scb-watch every 2 s and
-  // delivered into the game by filesync over the active WS. If the
-  // WS dies, the file goes stale — staleness is the only reliable
-  // signal we have inside the game that fresh code can no longer
-  // reach us.
   let heartbeatAgeMs = Infinity;
   try {
     if (ns.fileExists("/Temp/scb-heartbeat.txt", "home")) {
@@ -838,8 +730,6 @@ function getSystemHealth(ns) {
       if (beat) heartbeatAgeMs = Date.now() - beat;
     }
   } catch (_) {}
-  // 15 s threshold matches the watchdog's STALE_MS so both layers
-  // agree on the verdict.
   const syncStale = !isFinite(heartbeatAgeMs) || heartbeatAgeMs > 15_000;
   return {
     syncStale,
@@ -850,25 +740,7 @@ function getSystemHealth(ns) {
   };
 }
 
-function freeRam(ns, server) {
-  const reserve = server === "home" ? 256 : 0;
-  return Math.max(0, ns.getServerMaxRam(server) - ns.getServerUsedRam(server) - reserve);
-}
-
-async function fetchWithTimeout(url, options, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 // ─── persistent action log ──────────────────────────────────────────
-// .txt extension (not .log) so Bitburner's terminal `download` works
-// — only .js/.script/.txt files can be downloaded from in-game.
 const PLAYER_LOG = "/logs/ollama-player.txt";
 const PLAYER_LOG_PREV = "/logs/ollama-player.1.txt";
 const PLAYER_LOG_MAX_BYTES = 256_000;
@@ -880,16 +752,13 @@ function appendLog(ns, safety, line) {
     const entry = ts + " " + String(line).replace(/\s+$/, "") + "\n";
     let cur = ns.fileExists(PLAYER_LOG, "home") ? ns.read(PLAYER_LOG) : "";
     if (cur.length + entry.length > PLAYER_LOG_MAX_BYTES) {
-      // Rotate to avoid pathological growth (and slow ns.read each cycle).
       ns.write(PLAYER_LOG_PREV, cur, "w");
       cur = "";
     }
     ns.write(PLAYER_LOG, cur + entry, "w");
-  } catch (_) { /* swallow — logging must never crash the loop */ }
+  } catch (_) {}
 }
 
-// Last N log entries — fed back into the prompt as `recentActions` so
-// the model can see what it just did and avoid pathological loops.
 function readRecentLog(ns, n) {
   try {
     if (!ns.fileExists(PLAYER_LOG, "home")) return [];
@@ -899,24 +768,16 @@ function readRecentLog(ns, n) {
   } catch (_) { return []; }
 }
 
-// Look at the last K outcomes and report any (action, reason) pair
-// that has been rejected ≥ threshold times in a row. The system prompt
-// tells the AI to stop proposing actions in this set.
-function recentlyJammedActions(recent, { window = 30, threshold = 3 } = {}) {
-  const tail = recent.slice(-window);
+function recentlyJammedActions(recent, { windowSize = 30, threshold = 3 } = {}) {
+  const tail = recent.slice(-windowSize);
   const counts = new Map();
   for (const line of tail) {
-    // Lines look like:
-    //   2026-05-04T... SKIP  {"action":"upgrade_server",...} => upgrade_server would violate cash reserve
-    //   2026-05-04T... OK    {"action":"deploy_hack",...} => deployed alpha-ent on ai-pserv-0 W:9362 ...
     const m = line.match(/\b(SKIP|FAIL)\s+(\{[^}]+\})\s+=>\s+(.+)$/);
     if (!m) continue;
     const sig = m[2] + " :: " + m[3];
     counts.set(sig, (counts.get(sig) || 0) + 1);
   }
   const jammed = [];
-  for (const [sig, n] of counts) {
-    if (n >= threshold) jammed.push({ sig, count: n });
-  }
+  for (const [sig, n] of counts) if (n >= threshold) jammed.push({ sig, count: n });
   return jammed;
 }

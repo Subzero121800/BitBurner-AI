@@ -197,6 +197,56 @@ Defined in [`scb.js`](scb.js); passed to `/ollama-player.js` as a JSON arg every
 > Real talk on the in-game RAM footprint, since this got asked on r/Bitburner.
 
 <details>
+<summary><strong>🆕 v9 dispatch split — player dropped ~131 GB → ~8 GB</strong></summary>
+<br>
+
+Bitburner charges static RAM by walking every `ns.*` reference reachable through your imports. Up through v8, `ollama-player.js` did `import { executeAction } from "/ollama-actions.js"`, which pulled the full singularity / sleeve / gang / hacknet / bladeburner / cloud namespaces into the player's RAM ledger — about **131 GB** resident, even on cycles that just emitted `noop`. (The previous README claim of "~8 GB" for the player was wrong; sorry.)
+
+**v9 splits the dispatcher into purpose-specific helpers** under `/ai/dispatch/` and reads game state from snapshot files written by helpers under `/ai/snap/`. The player itself only knows how to:
+
+- read JSON state from `/Temp/*.json`
+- write a pending-action JSON
+- `ns.exec` the right helper for the chosen action category
+- poll for the result file and return it
+
+```
+ollama-player.js   ──reads──>   /Temp/network-state.json     ←─── /ai/snap/network.js     (~5 GB, runs <1s)
+                   ──reads──>   /Temp/cloud-state.json       ←─── /ai/snap/cloud.js       (~13 GB, runs <1s)
+                   ──reads──>   /Temp/progression-state.json ←─── /ai/snap/progression.js (~12-30 GB, runs <1s)
+
+                   ──writes──>  /Temp/ai-action-req.json
+                   ──exec───>   /ai/dispatch/<category>.js  ──writes──>  /Temp/ai-action-res.json
+                   ──polls──>   /Temp/ai-action-res.json
+```
+
+Each helper pays its own NS-namespace RAM cost **only while running** (a few hundred ms) and frees it on exit. The player's resident footprint drops from 131 GB to ~6–8 GB.
+
+**Helper map:**
+
+| Helper | Category | Static RAM (peak, transient) | When it runs |
+|---|---|---|---|
+| `/ai/snap/network.js`     | snapshot — topology + targets    | ~5 GB             | every scb cycle (~30s) |
+| `/ai/snap/cloud.js`       | snapshot — purchased server fleet | ~13 GB           | every scb cycle |
+| `/ai/snap/progression.js` | snapshot — augs + factions       | ~12 GB at SF4-3, up to ~120 GB at SF4-1 | every scb cycle |
+| `/ai/dispatch/deploy.js`      | hack/grow/weaken/deploy_hack | ~8 GB  | when AI deploys workers |
+| `/ai/dispatch/singularity.js` | travel/work/study/buy_program/install_augs/etc. | ~12 GB at SF4-3, ~120 GB at SF4-1 | when AI calls a singularity action |
+| `/ai/dispatch/cloud.js`       | buy_server / upgrade_server | ~13 GB | when AI mutates the fleet |
+| `/ai/dispatch/sleeve.js`      | sleeve_task                 | ~32 GB (no SF10-3) / ~4 GB (SF10-3) | rare — most sleeve work goes via `set_sleeve_plan` |
+| `/ai/dispatch/gang.js`        | gang_recruit/assign/ascend  | ~16 GB | rare — most gang work goes via `set_gang_plan` |
+| `/ai/dispatch/hacknet.js`     | buy/upgrade hacknet         | ~20 GB | when AI buys/upgrades hacknet |
+| `/ai/dispatch/blade.js`       | bb_action / bb_skill        | ~8 GB  | rare — most BB work goes via `set_bladeburner_plan` |
+| `/ai/dispatch/fs.js`          | read/write/run/kill/copy/patch | ~6 GB | when AI touches files |
+| `/ai/dispatch/ui.js`          | reconnect_remote_api        | ~1.6 GB | only on `syncStale` recovery |
+
+Inline (no exec round-trip, no extra RAM): `noop`, `wait`, `set_sleeve_plan`, `set_gang_plan`, `set_bladeburner_plan` (pure JSON writes the player handles itself).
+
+The user's home cap (`FLAGS.maxInGameRamGB`) still applies to every spawned helper — `scb.js`'s `withinRamBudget` check is honored before each `ns.exec`, so the cap can't be blown by a snap script firing.
+
+**Why the singularity numbers are a wide range:** `ns.singularity.*` functions cost 0.5 GB at the base rate but the SF4 multiplier is ×16 / ×4 / ×1 at SF4-1 / SF4-2 / SF4-3. Buying SF4-3 (and SF7-3 for bladeburner, SF10-3 for sleeve) collapses these costs ~8× across the board.
+
+</details>
+
+<details>
 <summary><strong><code>FLAGS.maxInGameRamGB</code> — the soft cap (recommended)</strong></summary>
 <br>
 
@@ -221,16 +271,17 @@ WARN  skipping /bladeburner-manager.js — would exceed maxInGameRamGB=32 (cost 
 
 The budget is also published to `/Temp/economy.json` and surfaced in the AI player's prompt as `state.budget`. When `state.budget.tight` is true, the model is told to stop proposing actions that spawn new home-side scripts and pick income actions that use existing capacity instead.
 
-**Suggested values:**
+**Suggested values** — caps are sized against the *measured* static RAM costs in the next table, with a small headroom margin for transient `/ai/snap/` + `/ai/dispatch/` helpers (which can briefly materialize 13–32 GB during execution).
 
-| Home RAM     | Recommended `maxInGameRamGB` | What you get                                                           |
-|--------------|------------------------------|------------------------------------------------------------------------|
-| 32 GB        | `16`                         | Orchestrator + watchdog only. Pure automation, no AI.                  |
-| 64 GB        | `32`                         | Add the AI player + auto-contracts.                                    |
-| 128 GB       | `64`                         | Add one heavy companion (gang-manager OR bladeburner-manager).         |
-| 256 GB+      | `0` (unlimited)              | Full stack.                                                            |
+| `maxInGameRamGB` | What fits at this cap                                                                  |
+|------------------|----------------------------------------------------------------------------------------|
+| `0` (unlimited)  | Full stack — default. Cap is off.                                                      |
+| `24`             | Orchestrator + watchdog only (~20.65 GB measured). Pure automation, no AI.            |
+| `48`             | Adds the v9 AI player (~27 GB total). Snapshot helpers fit transiently in headroom.   |
+| `96`             | Adds one heavy companion — gang-manager OR bladeburner-manager (~59 GB total).         |
+| `128`            | Adds gang + bladeburner + sleeve managers (~115 GB total). Full stack with margin.    |
 
-Default is `0` (unlimited) — no behavior change unless you opt in.
+Default is `0` (unlimited) — no behavior change unless you opt in. Pick the lowest cap that comfortably fits the components you actually want to run **plus the largest transient helper they'll trigger** (worst case: `/ai/snap/progression.js` at ~30 GB without SF4-3, or `/ai/dispatch/sleeve.js` at ~32 GB without SF10-3). Anything that would push past the cap is skipped with a `WARN` line and the AI is told via `state.budget.tight`.
 
 </details>
 
@@ -238,19 +289,41 @@ Default is `0` (unlimited) — no behavior change unless you opt in.
 <summary><strong>Approximate RAM cost on <code>home</code></strong></summary>
 <br>
 
-Bitburner charges static RAM per-script based on which `ns.*` API surfaces a script imports. Approximate costs:
+Bitburner charges static RAM per-script based on which `ns.*` API surfaces a script imports. Approximate costs **(v9 dispatch-split — see callout above)**:
 
-| Script                       | Static RAM | What drives the cost                                |
-|------------------------------|------------|-----------------------------------------------------|
-| `scb.js` (orchestrator)      | ~24 GB     | Singularity (purchase, backdoor), `ns.cloud.*`, scan |
-| `ollama-player.js`           | ~8 GB      | Singularity work/study/gym/crime, sleeve, gang, bladeburner |
-| `ollama-actions.js` (lib)    | ~0 GB      | Pure dispatcher; cost charged where called          |
-| `scb-watchdog.js`            | ~2 GB      | `ns.exec`, `ns.kill`, `ns.write`                    |
-| `gang-manager.js`            | ~16 GB     | `ns.gang.*` is RAM-heavy                            |
-| `bladeburner-manager.js`     | ~16 GB     | `ns.bladeburner.*` is RAM-heavy                     |
-| `hack/grow/weaken.js`        | ~1.7 GB ea | Run on worker servers, not home                     |
+**Resident (always running while features are enabled).** Numbers below are *measured in-game* via `getScriptRam` on a real save (not estimates):
 
-**Total core (orchestrator + watchdog only): ~26 GB.** Add the AI player: **~34 GB.** Add gang + bladeburner managers: **~66 GB.**
+| Script                       | Measured RAM | What drives the cost                                |
+|------------------------------|--------------|-----------------------------------------------------|
+| `scb.js` (orchestrator)      | **19.05 GB** | Singularity (purchase, backdoor), `ns.cloud.*`, scan |
+| `ollama-player.js` (v9)      | **~6–8 GB**  | `ns.exec` to dispatchers, `getPlayer`, `format`, JSON snapshot reads (was ~131 GB pre-v9) |
+| `ollama-actions.js` (lib)    | **~0 GB**    | Pure schema/validate; no NS calls (was implicitly ~131 GB via re-export)  |
+| `scb-watchdog.js`            | **1.60 GB**  | `ns.exec`, `ns.kill`, `ns.write`                    |
+| `gang-manager.js`            | **31.90 GB** | `ns.gang.*` namespace is heavier than expected — ~21 unique calls    |
+| `bladeburner-manager.js`     | ~28–32 GB    | `ns.bladeburner.*` ×17 unique calls. Same shape as gang.            |
+| `sleeve-manager.js`          | ~8–32 GB     | `ns.sleeve.*` cost collapses with SF10-3                            |
+| `stats.js`                   | **2.60 GB**  | Companion — small reader/UI                                          |
+| `spend-hacknet-hashes.js`    | **6.70 GB**  | Hacknet upgrade automation                                            |
+| `hack/grow/weaken.js`        | ~1.7 GB ea   | Run on worker servers, not home                     |
+
+**Transient (only resident while running — typically <1 second per invocation):**
+
+| Helper                          | Peak RAM   | Trigger                                       |
+|---------------------------------|------------|-----------------------------------------------|
+| `/ai/snap/network.js`           | ~5 GB      | Every scb cycle (~30 s)                        |
+| `/ai/snap/cloud.js`             | ~13 GB     | Every scb cycle                                |
+| `/ai/snap/progression.js`       | ~12–120 GB | Every scb cycle (range = SF4 multiplier)        |
+| `/ai/dispatch/deploy.js`        | ~8 GB      | AI emits hack/grow/weaken/deploy_hack          |
+| `/ai/dispatch/singularity.js`   | ~12–120 GB | AI emits work/study/buy/install (SF4-dependent) |
+| `/ai/dispatch/cloud.js`         | ~13 GB     | AI emits buy_server / upgrade_server           |
+| `/ai/dispatch/sleeve.js`        | ~4–32 GB   | AI emits sleeve_task (rare; SF10-dependent)    |
+| `/ai/dispatch/gang.js`          | ~16 GB     | AI emits gang_recruit/assign/ascend (rare)     |
+| `/ai/dispatch/hacknet.js`       | ~20 GB     | AI emits hacknet upgrade                       |
+| `/ai/dispatch/blade.js`         | ~8 GB      | AI emits bb_action / bb_skill (rare)            |
+| `/ai/dispatch/fs.js`            | ~6 GB      | AI emits read/write/run/kill/copy/patch        |
+| `/ai/dispatch/ui.js`            | ~1.6 GB    | AI emits reconnect_remote_api                  |
+
+**Total resident core (orchestrator + watchdog): ~20.65 GB** (measured). Add the v9 AI player: **~27 GB.** Add gang-manager: **~59 GB.** Full stack with gang + bladeburner + sleeve: **~115–120 GB** (gang and bladeburner are the heavy hitters; sleeve collapses to ~8 GB at SF10-3). The transient `/ai/snap/` and `/ai/dispatch/` helpers materialize on demand and free their RAM on exit, so they don't add to the steady-state floor — they just need to *fit* against `FLAGS.maxInGameRamGB` for the few hundred ms they run.
 
 Measure exact cost in-game: `getScriptRam("scb.js")` from another script, or check the RAM indicator in `nano`.
 
@@ -288,6 +361,7 @@ launchCompanions: true,
 companions: {
   "gang-manager.js":            true,    // 16 GB — only after you're in a gang
   "bladeburner-manager.js":     false,   // 16 GB — only after Bladeburner stats hit 100
+  "sleeve-manager.js":          true,    //  8 GB — only after SF-10 grants sleeves
 }
 ```
 
@@ -362,6 +436,38 @@ Applied patches are archived to `/ai/patches/applied-<ts>.json` for manual rollb
 </details>
 
 <details>
+<summary><strong>🎛️ Manager directives (AI-steerable companions)</strong></summary>
+<br>
+
+The three autonomous companions (`gang-manager.js`, `bladeburner-manager.js`, `sleeve-manager.js`) ship with safe-default heuristics, but the AI player can override them per-cycle by emitting one of three actions:
+
+| Action                  | Writes to                              | Plan shape (top-level keys)                                                                              |
+|-------------------------|----------------------------------------|----------------------------------------------------------------------------------------------------------|
+| `set_sleeve_plan`       | `/Temp/sleeve-directives.json`         | `default?:{task,...}`, `sleeves?:{ "0":{task,...} }`, `allowAugs?:bool`, `minCashForAugs?:number`        |
+| `set_gang_plan`         | `/Temp/gang-directives.json`           | `createFaction?`, `memberOverrides?:{name:task}`, `allowEquipment?:bool`, `warfareOverride?:bool\|null`  |
+| `set_bladeburner_plan`  | `/Temp/bladeburner-directives.json`    | `actionOverride?:{type,name}`, `antiChaosThreshold?:number`, `skillPriorities?:[name,...]`               |
+
+Sleeve task names: `shock_recovery` · `synchronize` · `idle` · `commit_crime` · `gym` · `study` · `company_work` · `faction_work`.
+
+**Each directive expires 10 minutes after `ts`.** If the AI goes silent or crashes, the companion falls back to its safe defaults — there's no way for a stale plan to steer indefinitely.
+
+**Each companion publishes its own state.** Every cycle each manager writes a snapshot to `/Temp/<manager>-state.json` (count, per-member tasks, shock/sync, chaos by city, etc.). The AI sees these as `state.managers.{sleeve,gang,bladeburner}` and uses them to decide whether overriding the default is even worth doing.
+
+Example `set_sleeve_plan` payload the AI might emit:
+
+```json
+{
+  "action": "set_sleeve_plan",
+  "plan": {
+    "default": { "task": "commit_crime", "crime": "Homicide" },
+    "sleeves": { "0": { "task": "synchronize" } }
+  }
+}
+```
+
+</details>
+
+<details>
 <summary><strong>🔁 Hot-reload + observability</strong></summary>
 <br>
 
@@ -376,6 +482,10 @@ Watched files: `scb.js`, `ollama-player.js`, `ollama-actions.js`. Editing `bridg
 
 The watcher also writes `/Temp/scb-heartbeat.txt` every 2 s. The in-game watchdog flags Remote API as offline if the heartbeat goes older than 15 s.
 
+**Companion auto-bounce.** Each in-repo companion (`gang-manager.js`, `bladeburner-manager.js`, `sleeve-manager.js`) carries a `*_VERSION_<n>` marker in its source and publishes the same marker into `/Temp/<name>-state.json` every cycle. When you edit a companion + bump its marker, scb.js's `ensureCompanionFresh` notices the disk version no longer matches the running snapshot's `version` field, kills the running instance, and lets the next cycle re-spawn the new code. So companion edits hot-reload too — no in-game restart needed beyond the version bump.
+
+**Per-companion state snapshots.** Each manager writes its full per-cycle state to `/Temp/<name>-state.json` (count, per-member tasks, shock/sync, chaos by city, etc.). The AI player picks these up as `state.managers.{sleeve, gang, bladeburner}` so it can decide whether to override the manager's defaults via the directive actions described above.
+
 **Persistent logs** — disk-backed history of what the orchestrator and AI did:
 
 | In-game file              | Source              | Contents                                                          |
@@ -384,6 +494,7 @@ The watcher also writes `/Temp/scb-heartbeat.txt` every 2 s. The in-game watchdo
 | `/logs/ollama-player.txt` | `ollama-player.js`  | `OK`/`SKIP`/`FAIL` per action with full context                   |
 | `/logs/gang.txt`          | `gang-manager.js`   | Recruit / task / ascend / equip events                            |
 | `/logs/bladeburner.txt`   | `bladeburner-manager.js` | Action selection, skill purchases                            |
+| `/logs/sleeve.txt`        | `sleeve-manager.js` | SET / STATUS / WARN / AUG events (per-sleeve)                     |
 
 (`.txt` rather than `.log` so the in-game `download <file>` command accepts them.)
 
@@ -394,11 +505,14 @@ tail -f .run/game-scb.log              # orchestrator cycle history (host-side)
 tail -f .run/game-ollama-player.log    # AI action stream (host-side)
 tail -f .run/game-gang.log             # gang manager
 tail -f .run/game-bladeburner.log      # bladeburner manager
+tail -f .run/game-sleeve.log           # sleeve manager
 ```
 
 Ad-hoc pulls work via the in-game terminal: `download /logs/scb.txt`.
 
 **Self-context loop:** `buildGameState` injects the last 30 lines of `/logs/ollama-player.txt` as `state.recentActions` so the model can see what it just did and avoid the "try the same forbidden upgrade 50 times in a row" failure mode. `state.jammedActions` lists `(action, reason)` pairs that failed 3+ times in a row — the prompt instructs the model to abandon them, and `safetyCheck` enforces it server-side.
+
+**Progression signals.** `state.progression` carries `pendingAugs`, `installReady`, `pendingInvites`, `affordableAugs` (faction + aug + price + rep), and `factionsWithRep` (with `nextAugRepGap`). Without these the model would noop-spam once hack income saturates; the prompt instructs it to join factions, buy affordable augs, work the smallest rep gap, or `install_augmentations` — `noop` is the explicit last resort.
 
 </details>
 
