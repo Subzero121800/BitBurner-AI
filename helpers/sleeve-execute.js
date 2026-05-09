@@ -66,6 +66,9 @@ function applyTask(ns, t) {
     case "study":          return ns.sleeve.setToUniversityCourse(idx, t.university || "Rothman University", t.course || "Algorithms");
     case "company_work":   return t.company ? ns.sleeve.setToCompanyWork(idx, t.company) : false;
     case "faction_work":   return t.faction ? ns.sleeve.setToFactionWork(idx, t.faction, t.type || "hacking") : false;
+    case "bladeburner":    return (t.type && t.name) ? ns.sleeve.setToBladeburnerAction(idx, t.type, t.name) : false;
+    case "travel":         return t.city ? ns.sleeve.travel(idx, t.city) : false;
+    case "buy_aug":        return t.aug ? ns.sleeve.purchaseSleeveAug(idx, t.aug) : false;
     default: return false;
   }
 }

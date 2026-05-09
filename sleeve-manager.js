@@ -121,10 +121,7 @@ function tick(ns, lastCount, lastStatusSig) {
     } else if (directives.default) {
       plan = directives.default;
     } else {
-      const k = info.skills || {};
-      const minCombat = Math.min(k.strength || 0, k.defense || 0, k.dexterity || 0, k.agility || 0);
-      const crime = minCombat >= HOMICIDE_STAT_THRESHOLD ? AUTO_DEFAULT_CRIME : AUTO_FALLBACK_CRIME;
-      plan = { task: "commit_crime", crime, _auto: "default(" + crime + ")" };
+      plan = pickAutoTask(info, s.idx);
     }
 
     if (!curMatches(cur, plan)) {
@@ -203,6 +200,77 @@ function decideAugs(ns, snap, directives) {
   return out;
 }
 
+// Smart per-slot role assignment. Distributes sleeves across:
+//   slot mod 4 == 0 -> train weakest combat stat at gym (until 200)
+//   slot mod 4 == 1 -> study Algorithms (until hacking >= 1000)
+//   slot mod 4 == 2 -> study Leadership (until charisma >= 200)
+//   slot mod 4 == 3 -> commit best crime the sleeve can pull
+// Once a role's threshold is met, that slot falls through to crime
+// too. Crimes are tiered by stats so weak sleeves don't burn cycles
+// failing high-tier crimes. AI overrides via set_sleeve_plan still
+// take precedence over this whole function.
+function pickAutoTask(info, sleeveIdx) {
+  const skills = info.skills || {};
+  const role = sleeveIdx % 4;
+
+  if (role === 0) {
+    const combats = [
+      { stat: "strength",  val: skills.strength  || 0 },
+      { stat: "defense",   val: skills.defense   || 0 },
+      { stat: "dexterity", val: skills.dexterity || 0 },
+      { stat: "agility",   val: skills.agility   || 0 }
+    ].sort((a, b) => a.val - b.val);
+    if (combats[0].val < 200) {
+      return {
+        task: "gym",
+        gym:  "Powerhouse Gym",
+        stat: combats[0].stat,
+        _auto: "gym " + combats[0].stat + "=" + combats[0].val
+      };
+    }
+  } else if (role === 1) {
+    if ((skills.hacking || 0) < 1000) {
+      return {
+        task: "study",
+        university: "Rothman University",
+        course: "Algorithms",
+        _auto: "study hack=" + (skills.hacking || 0)
+      };
+    }
+  } else if (role === 2) {
+    if ((skills.charisma || 0) < 200) {
+      return {
+        task: "study",
+        university: "Rothman University",
+        course: "Leadership",
+        _auto: "study cha=" + (skills.charisma || 0)
+      };
+    }
+  }
+
+  const crime = bestCrime(skills);
+  return {
+    task: "commit_crime",
+    crime,
+    _auto: "crime(" + crime + ") slot=" + sleeveIdx
+  };
+}
+
+function bestCrime(skills) {
+  const s  = skills.strength  || 0;
+  const d  = skills.defense   || 0;
+  const x  = skills.dexterity || 0;
+  const a  = skills.agility   || 0;
+  const ch = skills.charisma  || 0;
+  const min = Math.min(s, d, x, a);
+  if (min >= 1000 && ch >= 1000) return "Heist";
+  if (min >= 300  && ch >= 200)  return "Assassination";
+  if (min >= 200  && ch >= 100)  return "Kidnap and Ransom";
+  if (min >= 200)                return "Grand Theft Auto";
+  if (min >= 100)                return "Homicide";
+  return "Mug";
+}
+
 function curMatches(cur, plan) {
   if (!cur) return false;
   const t = String(cur.type || "").toUpperCase();
@@ -215,6 +283,9 @@ function curMatches(cur, plan) {
     case "study":          return t === "CLASS"   && !String(cur.classType || "").toLowerCase().includes("gym");
     case "company_work":   return t === "COMPANY" && cur.companyName === plan.company;
     case "faction_work":   return t === "FACTION" && cur.factionName === plan.faction;
+    case "bladeburner":    return t === "BLADEBURNER" && cur.actionType === plan.type && cur.actionName === plan.name;
+    case "travel":         return false; // one-shot; always re-issue if directive exists
+    case "buy_aug":        return false; // one-shot purchase; always re-issue
   }
   return false;
 }
@@ -227,6 +298,9 @@ function describePlan(plan) {
     case "faction_work": return "faction:" + (plan.faction || "?") + "/" + (plan.type || "hacking");
     case "gym":          return "gym:" + (plan.stat || "strength");
     case "study":        return "study:" + (plan.course || "Algorithms");
+    case "bladeburner":  return "bb:" + (plan.type || "?") + "/" + (plan.name || "?");
+    case "travel":       return "travel:" + (plan.city || "?");
+    case "buy_aug":      return "buy_aug:" + (plan.aug || "?");
     default:             return plan.task;
   }
 }

@@ -61,7 +61,7 @@ export const ACTION_SCHEMA = [
   { action: "join_faction",   args: ["faction"],            desc: "Accept faction invite" },
   { action: "donate_faction", args: ["faction", "amount"],  desc: "Donate to faction" },
 
-  { action: "sleeve_task", args: ["sleeve", "task"], desc: "Assign sleeve task" },
+  { action: "sleeve_task", args: ["sleeve", "task"], desc: "Assign sleeve task. task: crime|faction|company|gym|study|sync|recover|idle|bladeburner|travel|buy_aug|list_augs (use the right extra args for each — see prompt rules)" },
 
   { action: "gang_recruit", args: [],                  desc: "Recruit gang member" },
   { action: "gang_assign",  args: ["member", "task"],  desc: "Assign gang member task" },
@@ -89,7 +89,7 @@ export const ACTION_SCHEMA = [
   { action: "reconnect_remote_api",   args: [], desc: "Best-effort programmatic Options → Remote API → Connect via DOM. Use when state.systemHealth.syncStale is true." },
 
   // Manager directives — pure /Temp/ writes, handled inline in the player.
-  { action: "set_sleeve_plan",      args: ["plan"], desc: "Steer sleeve-manager. plan = { default?:{task,...}, sleeves?:{ '0':{task,...} } }. Tasks: shock_recovery|synchronize|idle|commit_crime|gym|study|company_work|faction_work" },
+  { action: "set_sleeve_plan",      args: ["plan"], desc: "Steer sleeve-manager. plan = { default?:{task,...}, sleeves?:{ '0':{task,...} } }. Tasks: shock_recovery|synchronize|idle|commit_crime|gym|study|company_work|faction_work|bladeburner|travel|buy_aug. Extra fields per task: crime/gym/stat/course/university/company/faction/type/city/aug/name." },
   { action: "set_gang_plan",        args: ["plan"], desc: "Steer gang-manager. plan = { createFaction?, memberOverrides?:{name:task}, allowEquipment?:bool, warfareOverride?:bool|null }" },
   { action: "set_bladeburner_plan", args: ["plan"], desc: "Steer bladeburner-manager. plan = { actionOverride?:{type,name}, antiChaosThreshold?:number, skillPriorities?:[name,...] }" }
 ];

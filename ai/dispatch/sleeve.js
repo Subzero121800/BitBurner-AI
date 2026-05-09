@@ -57,9 +57,31 @@ function exec(ns, a) {
     case "sync":    return wrap(ns.sleeve.setToSynchronize(idx),    "sleeve " + idx + " sync");
     case "recover": return wrap(ns.sleeve.setToShockRecovery(idx), "sleeve " + idx + " recover");
     case "idle":    return wrap(ns.sleeve.setToIdle(idx),           "sleeve " + idx + " idle");
+    case "bladeburner": {
+      if (!a.type || !a.name) return fail("bladeburner needs {type, name}");
+      return wrap(ns.sleeve.setToBladeburnerAction(idx, a.type, a.name),
+                  "sleeve " + idx + " bb " + a.type + "/" + a.name);
+    }
+    case "travel": {
+      if (!a.city) return fail("travel needs {city}");
+      return wrap(ns.sleeve.travel(idx, a.city), "sleeve " + idx + " travel " + a.city);
+    }
+    case "buy_aug": {
+      if (!a.aug) return fail("buy_aug needs {aug}");
+      return wrap(ns.sleeve.purchaseSleeveAug(idx, a.aug),
+                  "sleeve " + idx + " bought " + a.aug);
+    }
+    case "list_augs": {
+      let augs = [];
+      try { augs = ns.sleeve.getSleevePurchasableAugs(idx) || []; } catch (_) {}
+      const top = augs.slice().sort((x, y) => x.cost - y.cost).slice(0, 10);
+      return ok("sleeve " + idx + " augs: " + JSON.stringify(top));
+    }
     default: return fail("unknown sleeve task: " + a.task);
   }
 }
+
+function ok(r) { return { success: true, result: String(r) }; }
 
 function normalize(ns, kind, value) {
   const map = {
