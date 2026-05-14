@@ -1,6 +1,6 @@
 /**
  * /ai/action-schema.js — pure data and validation, zero NS surface
- * SCHEMA_VERSION_1
+ * SCHEMA_VERSION_2
  *
  * No netscript references appear in this file - not in code, comments,
  * or string literals. The static RAM cost imported by callers is 0 GB.
@@ -66,7 +66,18 @@ export const ACTION_SCHEMA = [
 
   { action: "set_sleeve_plan",      args: ["plan"], desc: "Steer the sleeve manager" },
   { action: "set_gang_plan",        args: ["plan"], desc: "Steer the gang manager" },
-  { action: "set_bladeburner_plan", args: ["plan"], desc: "Steer the bladeburner manager" }
+  { action: "set_bladeburner_plan", args: ["plan"], desc: "Steer the bladeburner manager" },
+  { action: "set_darknet_plan",     args: ["plan"], desc: "Steer the darknet manager" },
+
+  { action: "darknet_probe",        args: [],                                      desc: "List darknet neighbours" },
+  { action: "darknet_authenticate", args: ["host", "password?"],                   desc: "Crack a darknet server" },
+  { action: "darknet_heartbleed",   args: ["host", "threads?", "peek?"],           desc: "Heartbleed exploit" },
+  { action: "darknet_phishing",     args: ["threads?"],                            desc: "Phishing attack from a darknet server" },
+  { action: "darknet_memreal",      args: ["host"],                                desc: "Memory reallocation" },
+  { action: "darknet_migrate",      args: ["host", "threads?"],                    desc: "Induce server migration" },
+  { action: "darknet_stasis_set",   args: ["host"],                                desc: "Pin a server with a stasis link" },
+  { action: "darknet_open_cache",   args: ["filename", "suppressToast?"],          desc: "Open a .cache file" },
+  { action: "darknet_pumpdump",     args: ["symbol", "threads?"],                  desc: "Pump/dump a stock for volatility" }
 ];
 
 export const DISPATCH_MAP = {
@@ -96,8 +107,15 @@ export const DISPATCH_MAP = {
 
   reconnect_remote_api: "ui",
 
+  darknet_probe: "darknet", darknet_authenticate: "darknet",
+  darknet_heartbleed: "darknet", darknet_phishing: "darknet",
+  darknet_memreal: "darknet", darknet_migrate: "darknet",
+  darknet_stasis_set: "darknet", darknet_open_cache: "darknet",
+  darknet_pumpdump: "darknet",
+
   noop: "inline", wait: "inline",
-  set_sleeve_plan: "inline", set_gang_plan: "inline", set_bladeburner_plan: "inline"
+  set_sleeve_plan: "inline", set_gang_plan: "inline", set_bladeburner_plan: "inline",
+  set_darknet_plan: "inline"
 };
 
 export const INLINE_ACTIONS = new Set(

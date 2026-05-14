@@ -1,6 +1,6 @@
 /** @param {NS} ns */
 export async function main(ns) {
-  // WATCHDOG_VERSION_7
+  // WATCHDOG_VERSION_9
   ns.disableLog("ALL");
   try { ns.ui?.openTail?.(); } catch (_) {}
 
@@ -64,16 +64,12 @@ export async function main(ns) {
       if (state === "offline") {
         const ageS = isFinite(age) ? Math.round(age / 1000) + "s" : "never";
         ns.tprint("WARN  Remote API offline (heartbeat " + ageS + ")");
-        ns.toast("Remote API offline — auto-reconnecting...", "warning", 8000);
-        await tryReconnect();
+        ns.toast("Remote API offline", "warning", 8000);
       } else {
         ns.tprint("SUCCESS  Remote API online");
         ns.toast("Remote API connected", "success", 4000);
       }
       prevState = state;
-    } else if (state === "offline") {
-      // Stay offline → keep trying to reconnect quietly.
-      await tryReconnect();
     }
 
     // ── 3. periodic alive ping ─────────────────────────────────────
@@ -140,78 +136,5 @@ export async function main(ns) {
   function readFileSafe(p) {
     try { return ns.fileExists(p, "home") ? ns.read(p) : ""; }
     catch (_) { return ""; }
-  }
-
-  // Aggressive DOM-based reconnect: opens the Options panel,
-  // navigates to the Remote API tab, clicks Connect. Far more
-  // reliable than the previous "find a Connect button if any panel
-  // happens to be open" approach. globalThis["doc"+"ument"] is the
-  // dynamic-key trick to dodge Bitburner's static RAM scanner; if a
-  // future game version closes that loophole this will degrade
-  // gracefully (returns false, the toast still fires).
-  async function tryReconnect() {
-    try {
-      const doc = globalThis["doc" + "ument"];
-      if (!doc || typeof doc.querySelectorAll !== "function") return false;
-
-      // 1. quick path: a Connect button is already on screen.
-      let btn = findByText(doc, "Connect", (el) =>
-        (el.textContent || "").trim() === "Connect" && el.tagName === "BUTTON"
-      );
-      if (btn) { btn.click(); ns.print("INFO  fast-path Connect click"); return true; }
-
-      // 2. open Options. Try common nav variants.
-      const optionsBtn = findByText(doc, "Options", (el) =>
-        ["BUTTON", "A", "LI", "DIV"].includes(el.tagName) &&
-        (el.textContent || "").trim() === "Options"
-      );
-      if (!optionsBtn) {
-        ns.print("INFO  reconnect: Options nav not found");
-        return false;
-      }
-      optionsBtn.click();
-      await ns.sleep(200);
-
-      // 3. click the Remote API tab
-      const remoteTab = findByText(doc, "Remote API", (el) =>
-        (el.textContent || "").trim() === "Remote API"
-      );
-      if (remoteTab) { remoteTab.click(); await ns.sleep(200); }
-
-      // 4. now find Connect (or report Disconnect — already up)
-      btn = findByText(doc, "Connect", (el) =>
-        el.tagName === "BUTTON" && (el.textContent || "").trim() === "Connect"
-      );
-      if (!btn) {
-        const dis = findByText(doc, "Disconnect", (el) =>
-          el.tagName === "BUTTON" && (el.textContent || "").trim() === "Disconnect"
-        );
-        if (dis) {
-          ns.print("INFO  reconnect: Disconnect shown, already connected");
-          return true;
-        }
-        ns.print("INFO  reconnect: Connect button not located after opening panel");
-        return false;
-      }
-      btn.click();
-      ns.print("SUCCESS  navigated Options→Remote API→Connect");
-      return true;
-    } catch (e) {
-      ns.print("WARN  reconnect attempt failed: " + String(e.message || e));
-      return false;
-    }
-  }
-
-  function findByText(doc, label, predicate) {
-    try {
-      const all = doc.querySelectorAll("button, a, li, [role=tab], [role=menuitem], div, span");
-      for (const el of all) {
-        const t = (el.textContent || "").trim();
-        if (t === label || t.toLowerCase() === label.toLowerCase()) {
-          if (!predicate || predicate(el)) return el;
-        }
-      }
-    } catch (_) {}
-    return null;
   }
 }

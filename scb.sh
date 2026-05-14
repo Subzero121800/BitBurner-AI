@@ -199,6 +199,43 @@ case "${1:-start}" in
   sync)    start_sync ;;
   bridge)  start_bridge ;;
   watch)   start_watch ;;
+  sync-smart)
+    # Push only files whose content changed since last sync.
+    # Compares SHA-256 hashes stored in .run/sync-hashes.json.
+    # Does NOT restart scb.js unless scb.js itself actually changed.
+    if ! is_alive "$SYNC_PID"; then
+      c_red "filesync isn't running — start it first: ./scb.sh sync"
+      exit 1
+    fi
+    c_blue "smart-sync: checking which files changed..."
+    node watch/sync-smart.js 2>&1 | while IFS= read -r line; do
+      if [[ $line == push* ]]; then
+        c_green "  $line"
+      else
+        c_blue "  $line"
+      fi
+    done
+    sleep 1
+    ;;
+  sync-force)
+    # Like sync-smart but ignores stored hashes — pushes everything and
+    # resets the hash store. Use when the game was reset or reconnected.
+    if ! is_alive "$SYNC_PID"; then
+      c_red "filesync isn't running — start it first: ./scb.sh sync"
+      exit 1
+    fi
+    c_blue "force-sync: pushing all files and resetting hash store..."
+    node watch/sync-smart.js --force 2>&1 | while IFS= read -r line; do
+      if [[ $line == push* ]]; then
+        c_green "  $line"
+      else
+        c_blue "  $line"
+      fi
+    done
+    sleep 2
+    c_blue "tail of sync.log:"
+    tail -20 "$SYNC_LOG" || true
+    ;;
   sync-all)
     if ! is_alive "$SYNC_PID"; then
       c_red "filesync isn't running — start it first: ./scb.sh sync"
@@ -229,19 +266,30 @@ case "${1:-start}" in
     : > "$WATCH_LOG" 2>/dev/null || true
     tail -f "$SYNC_LOG" "$BRIDGE_LOG" "$WATCH_LOG" 2>/dev/null
     ;;
+  sync-status)
+    # Show hash store summary without touching anything.
+    if [[ -f "$RUN_DIR/sync-hashes.json" ]]; then
+      count=$(python3 -c "import json,sys; d=json.load(open('$RUN_DIR/sync-hashes.json')); print(len(d))" 2>/dev/null || echo "?")
+      c_green "hash store has $count entries — $RUN_DIR/sync-hashes.json"
+    else
+      c_yel "no hash store yet — run sync-smart or sync-force first"
+    fi
+    ;;
   *)
     cat <<EOF
-usage: $0 {start|stop|restart|status|logs|sync|bridge|watch|sync-all}
+usage: $0 {start|stop|restart|status|logs|sync|bridge|watch|sync-smart|sync-force|sync-all}
 
-  start     start filesync + scb-watch (NOT bridge — opt-in)
-  stop      stop all services (including bridge if running)
-  restart   stop everything, then start filesync + watch
-  status    show running pids
-  logs      tail all log files (Ctrl-C to exit)
-  sync      start only the filesync watcher
-  bridge    start the Claude bridge (only if you want claude as backend)
-  watch     start only the file watcher / hot-reload daemon
-  sync-all  touch every .js/.script/.txt so filesync re-pushes them
+  start       start filesync + scb-watch (NOT bridge — opt-in)
+  stop        stop all services (including bridge if running)
+  restart     stop everything, then start filesync + watch
+  status      show running pids
+  logs        tail all log files (Ctrl-C to exit)
+  sync        start only the filesync watcher
+  bridge      start the Claude bridge (only if you want claude as backend)
+  watch       start only the file watcher / hot-reload daemon
+  sync-smart  push only files that changed since last sync (hash-based)
+  sync-force  push all files + reset hash store (use after game reset)
+  sync-all    touch every .js/.script/.txt (legacy — use sync-smart instead)
 
 Default backend is Ollama. scb-watch probes 127.0.0.1:11434 by default
 and writes the first reachable host to /Temp/ollama-host.txt. To add

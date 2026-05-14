@@ -173,6 +173,8 @@ function runInline(ns, action) {
       return setDirective(ns, "/Temp/gang-directives.json", action.plan, "gang");
     case "set_bladeburner_plan":
       return setDirective(ns, "/Temp/bladeburner-directives.json", action.plan, "bladeburner");
+    case "set_darknet_plan":
+      return setDirective(ns, "/Temp/darknet-directives.json", action.plan, "darknet");
     default:
       return { success: false, result: "inline: unhandled " + action.action };
   }
@@ -265,7 +267,8 @@ function buildGameState(ns, safety) {
     managers: {
       sleeve:      readJson(ns, "/Temp/sleeve-state.json"),
       gang:        readJson(ns, "/Temp/gang-state.json"),
-      bladeburner: readJson(ns, "/Temp/bladeburner-state.json")
+      bladeburner: readJson(ns, "/Temp/bladeburner-state.json"),
+      darknet:     readJson(ns, "/Temp/darknet-state.json")
     },
 
     serverFleet:      cloud.serverFleet,
@@ -393,6 +396,8 @@ function buildPrompt(state, safety) {
     "- Sleeve auto-default (when no directive): rotates roles per slot — slot mod 4: 0=train weakest combat, 1=study Algorithms, 2=study Leadership, 3=best crime sleeve can run (Mug -> Homicide -> Grand Theft Auto -> Kidnap -> Assassination -> Heist as stats grow). Override via set_sleeve_plan when player needs a specific resource (e.g. faction rep, BB intel, hacking xp, money).",
     "- Example gang plan: {memberOverrides:{Alpha:'Vigilante Justice'},allowEquipment:false,warfareOverride:false}",
     "- Example bladeburner plan: {actionOverride:{type:'Operation',name:'Assassination'},antiChaosThreshold:30}",
+    "- Darknet (Bitburner 3.0.0+, ns.dnet) — autonomous manager owns sessions and stasis links. state.managers.darknet exposes {supported,hasNavigator,instability,mode,stasis,neighbors,sessions}. If !supported or !hasNavigator, ignore darknet entirely — direct dnet_* calls and set_darknet_plan will no-op. Default mode is 'auto' (probe + authenticate adjacent + heartbleed peek for intel). To shift focus emit set_darknet_plan with mode: 'cha_grind' (phishing for charisma), 'explore' (lean into heartbleed), 'manual' (use ops array — see schema), or 'off' (idle). Prefer set_darknet_plan over direct dnet_* one-shots unless you need a specific cache opened or a stock pumped.",
+    "- Example darknet plan: {mode:'cha_grind',stasisPolicy:'deepest'}  or  {mode:'manual',ops:[{op:'heartbleed',host:'gateway-3',threads:4,peek:true},{op:'open_cache',filename:'/dnet/intel.cache'}]}",
     "- Don't set a plan if the manager's default is doing the right thing — overrides are for when you have specific strategic intent.",
     "",
     "RAM budget (only relevant if state.budget.capped is true):",

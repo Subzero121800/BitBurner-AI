@@ -1,6 +1,6 @@
 /**
  * ollama-actions.js — AI Action Schema (zero-RAM library)
- * ACTIONS_VERSION_5_SCHEMA_ONLY
+ * ACTIONS_VERSION_6_SCHEMA_ONLY
  *
  * As of v5 this file is intentionally NS-call-free. The previous
  * monolithic executeAction dispatcher was inflating ollama-player.js
@@ -91,7 +91,22 @@ export const ACTION_SCHEMA = [
   // Manager directives — pure /Temp/ writes, handled inline in the player.
   { action: "set_sleeve_plan",      args: ["plan"], desc: "Steer sleeve-manager. plan = { default?:{task,...}, sleeves?:{ '0':{task,...} } }. Tasks: shock_recovery|synchronize|idle|commit_crime|gym|study|company_work|faction_work|bladeburner|travel|buy_aug. Extra fields per task: crime/gym/stat/course/university/company/faction/type/city/aug/name." },
   { action: "set_gang_plan",        args: ["plan"], desc: "Steer gang-manager. plan = { createFaction?, memberOverrides?:{name:task}, allowEquipment?:bool, warfareOverride?:bool|null }" },
-  { action: "set_bladeburner_plan", args: ["plan"], desc: "Steer bladeburner-manager. plan = { actionOverride?:{type,name}, antiChaosThreshold?:number, skillPriorities?:[name,...] }" }
+  { action: "set_bladeburner_plan", args: ["plan"], desc: "Steer bladeburner-manager. plan = { actionOverride?:{type,name}, antiChaosThreshold?:number, skillPriorities?:[name,...] }" },
+
+  // Darknet (Bitburner 3.0.0+, ns.dnet) — slim manager owns sessions;
+  // most of the time emit set_darknet_plan instead of direct dnet_* calls.
+  { action: "set_darknet_plan",     args: ["plan"], desc: "Steer darknet-manager. plan = { mode?:'auto'|'explore'|'phish'|'cha_grind'|'manual'|'off', authenticate?:[host,...], minDepth?, maxDepth?, stasisPolicy?:'deepest'|'manual', manualStasis?:[host,...], allowMigration?:bool, migrate?:[host,...], pumpDump?:{enabled,symbols,threads?}, ops?:[{op,host?,threads?,...}] }" },
+
+  // Direct Darknet one-shots — use sparingly; the manager handles the loop.
+  { action: "darknet_probe",        args: [],                                      desc: "List darknet neighbours of the current server" },
+  { action: "darknet_authenticate", args: ["host", "password?"],                   desc: "Crack a darknet server. Manager normally owns this." },
+  { action: "darknet_heartbleed",   args: ["host", "threads?", "peek?"],           desc: "Heartbleed exploit for log intel. Set peek:true to avoid consuming logs." },
+  { action: "darknet_phishing",     args: ["threads?"],                            desc: "Phishing attack from a darknet server — money + charisma + cache drops" },
+  { action: "darknet_memreal",      args: ["host"],                                desc: "Free RAM blocked by the server owner" },
+  { action: "darknet_migrate",      args: ["host", "threads?"],                    desc: "Force a server to potentially relocate in the darknet topology" },
+  { action: "darknet_stasis_set",   args: ["host"],                                desc: "Pin a server in place with a stasis link" },
+  { action: "darknet_open_cache",   args: ["filename", "suppressToast?"],          desc: "Open a .cache file scraped from a darknet server" },
+  { action: "darknet_pumpdump",     args: ["symbol", "threads?"],                  desc: "Increase a stock's volatility for trading exploitation" }
 ];
 
 // Action -> /ai/dispatch/<category>.js (or "inline" for player-handled).
@@ -123,9 +138,16 @@ export const DISPATCH_MAP = {
 
   reconnect_remote_api: "ui",
 
+  darknet_probe: "darknet", darknet_authenticate: "darknet",
+  darknet_heartbleed: "darknet", darknet_phishing: "darknet",
+  darknet_memreal: "darknet", darknet_migrate: "darknet",
+  darknet_stasis_set: "darknet", darknet_open_cache: "darknet",
+  darknet_pumpdump: "darknet",
+
   // Inline (handled in the player; no exec):
   noop: "inline", wait: "inline",
-  set_sleeve_plan: "inline", set_gang_plan: "inline", set_bladeburner_plan: "inline"
+  set_sleeve_plan: "inline", set_gang_plan: "inline", set_bladeburner_plan: "inline",
+  set_darknet_plan: "inline"
 };
 
 // Convenience set for inline-only actions.

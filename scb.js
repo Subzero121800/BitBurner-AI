@@ -1,7 +1,7 @@
 /**
  * scb.js — Master Orchestrator
  * Bitburner 3.0.0 compatible
- * SCB_VERSION_13_THIN
+ * SCB_VERSION_14_YIELD
  *
  * v13 also slims scb.js itself by spawning helpers under /helpers/:
  *   - /helpers/shop.js          (TOR + program purchases)
@@ -72,12 +72,15 @@ const FLAGS = {
     // All three are autonomous with safe defaults AND can be steered
     // by the AI player via /Temp/<manager>-directives.json
     // (set_sleeve_plan / set_gang_plan / set_bladeburner_plan).
-    "gang-manager.js":            true,    // gang autopilot — needs SF-2
-    "bladeburner-manager.js":     true,    // bladeburner autopilot — needs SF-6
-    "sleeve-manager.js":          true,    // sleeve autopilot — needs SF-10
+    "gang-manager.js":            false,   // gang autopilot — needs SF-2
+    "bladeburner-manager.js":     false,   // bladeburner autopilot — needs SF-6
+    "sleeve-manager.js":          true,
+    "darknet-manager.js":         true,
 
     // Individual managers (user-supplied; skipped silently if missing)
     "stats.js":                   true,
+    "gang.js":                    true,
+    "bladeburner.js":             true,
     "stockmaster.js":             false,
     "sleeve.js":                  false,
     "faction-manager.js":         false,
@@ -303,8 +306,10 @@ export async function main(ns) {
       }
     }
 
+    await ns.sleep(0); // yield before heavy sync work
+
     const portCrax = getAvailablePortCrackers(ns);
-    const allServers = deepScan(ns);
+    const { servers: allServers, cache: scanCache } = deepScan(ns);
 
     ns.print("─".repeat(52));
     ns.print("INFO  Cycle @ " + new Date().toLocaleTimeString());
@@ -325,7 +330,9 @@ export async function main(ns) {
     const needPorts = [];
 
     if (FLAGS.scanAndRoot) {
+      let _batchCount = 0;
       for (const hostname of allServers) {
+        if (++_batchCount % 20 === 0) await ns.sleep(0); // yield every 20 servers
         if (hostname === "home") continue;
         if (hostname.startsWith("hacknet")) continue;
 
@@ -333,7 +340,7 @@ export async function main(ns) {
         if (server.purchasedByPlayer) continue;
 
         if (server.hasAdminRights && server.backdoorInstalled) {
-          if (FLAGS.deployHackScripts && deployHackScripts(ns, hostname)) deployed++;
+          if (FLAGS.deployHackScripts && deployHackScripts(ns, hostname, allServers)) deployed++;
           continue;
         }
 
@@ -359,7 +366,7 @@ export async function main(ns) {
         const refreshed = ns.getServer(hostname);
 
         if (FLAGS.backdoor && !refreshed.backdoorInstalled) {
-          const path = findPath(ns, "home", hostname);
+          const path = findPath(scanCache, "home", hostname);
           if (path.length === 0) {
             ns.print("ERROR  No path to " + hostname);
           } else {
@@ -368,7 +375,7 @@ export async function main(ns) {
         }
 
         if (FLAGS.deployHackScripts && ns.hasRootAccess(hostname)) {
-          if (deployHackScripts(ns, hostname)) deployed++;
+          if (deployHackScripts(ns, hostname, allServers)) deployed++;
         }
       }
     }
@@ -402,6 +409,8 @@ export async function main(ns) {
     if (needPorts.length > 0) {
       ns.print("WARN  Skipped (need more ports than " + portCrax.length + "): " + needPorts.length + " — " + needPorts.slice(0, 5).join(", ") + (needPorts.length > 5 ? ", +" + (needPorts.length - 5) + " more" : ""));
     }
+
+    await ns.sleep(0); // yield after server loop
 
     // ─── Pserv deploy pass ────────────────────────────────────────
     // v13: spawned helper instead of inline so scb.js doesn't hold
@@ -567,7 +576,7 @@ function readJson(ns, path) {
   } catch (_) { return null; }
 }
 
-function deployHackScripts(ns, hostname) {
+function deployHackScripts(ns, hostname, allServers) {
   const HACK = "hack.js";
   const GROW = "grow.js";
   const WEAK = "weaken.js";
@@ -580,7 +589,7 @@ function deployHackScripts(ns, hostname) {
     return false;
   }
 
-  const target = pickBestTarget(ns);
+  const target = pickBestTarget(ns, allServers);
   if (!target) return false;
 
   const free = ns.getServerMaxRam(hostname) - ns.getServerUsedRam(hostname);
@@ -639,13 +648,13 @@ function ensureLoopWorkersOnHome(ns) {
 
 let bestTargetCache = { name: null, expires: 0 };
 
-function pickBestTarget(ns) {
+function pickBestTarget(ns, knownServers) {
   if (Date.now() < bestTargetCache.expires && bestTargetCache.name) {
     return bestTargetCache.name;
   }
 
   const player = ns.getPlayer();
-  const all = deepScan(ns);
+  const all = knownServers || deepScan(ns).servers;
 
   const candidates = all
     .filter((s) => s !== "home")
@@ -708,7 +717,7 @@ async function ensureWatchdogExists(ns, filename) {
 
 function ensurePlayerScripts(ns) {
   const need = [
-    { file: "/ollama-actions.js", marker: "ACTIONS_VERSION_5"  },
+    { file: "/ollama-actions.js", marker: "ACTIONS_VERSION_6"  },
     { file: "/ollama-player.js",  marker: "PLAYER_VERSION_10" }
   ];
 
@@ -788,33 +797,38 @@ async function cleanupDeprecated(ns) {
   ns.tprint("INFO  cleanup complete, moved: " + moved + ", missing: " + missing);
 }
 
+// Returns { servers: string[], cache: Map<string, string[]> }.
+// Building the cache here means findPath never calls ns.scan again —
+// each server is scanned exactly once per cycle regardless of how
+// many backdoor paths need computing.
 function deepScan(ns) {
   const visited = new Set();
-  const queue = ["home"];
+  const cache   = new Map();
+  const queue   = ["home"];
 
   while (queue.length > 0) {
     const cur = queue.pop();
-
     if (visited.has(cur)) continue;
-
     visited.add(cur);
-
-    for (const n of ns.scan(cur)) {
+    const neighbors = ns.scan(cur);
+    cache.set(cur, neighbors);
+    for (const n of neighbors) {
       if (!visited.has(n)) queue.push(n);
     }
   }
 
-  return [...visited];
+  return { servers: [...visited], cache };
 }
 
-function findPath(ns, source, target) {
+// Uses the scan cache built by deepScan — zero additional ns.scan calls.
+function findPath(cache, source, target) {
   const visited = new Set([source]);
   const queue = [[source, []]];
 
   while (queue.length > 0) {
     const [current, path] = queue.shift();
 
-    for (const neighbor of ns.scan(current)) {
+    for (const neighbor of (cache.get(current) || [])) {
       if (visited.has(neighbor)) continue;
 
       visited.add(neighbor);

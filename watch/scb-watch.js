@@ -256,8 +256,56 @@ setInterval(detectOllamaHost, OLLAMA_PROBE_MS);
 // In-game scripts POST log content to http://127.0.0.1:9999/sink/{name}
 // and we append the body to .run/game-{name}.log so the host has a
 // durable, tail-able copy. Bound to localhost only — no LAN exposure.
+const DL_DIR = path.join(RUN_DIR, "downloaded");
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin":          "*",
+  "Access-Control-Allow-Methods":         "POST, OPTIONS",
+  "Access-Control-Allow-Headers":         "Content-Type",
+  "Access-Control-Allow-Private-Network": "true",
+};
+
 const sinkServer = http.createServer((req, res) => {
-  if (req.method !== "POST" || !req.url.startsWith("/sink/")) {
+  // Browser preflight for cross-origin fetch() from the game
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, CORS_HEADERS); res.end(); return;
+  }
+  if (req.method !== "POST") {
+    res.writeHead(405, CORS_HEADERS); res.end("method not allowed"); return;
+  }
+
+  // ── /dl  — receive a game file and write it under .run/downloaded/ ──
+  if (req.url === "/dl") {
+    let total = 0;
+    const chunks = [];
+    req.on("data", (c) => {
+      total += c.length;
+      if (total > SINK_MAX_BYTES) { req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (total > SINK_MAX_BYTES) { res.writeHead(413, CORS_HEADERS); res.end("too large"); return; }
+      try {
+        const { path: gamePath, content } = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if (typeof gamePath !== "string" || gamePath.length === 0) throw new Error("missing path");
+        // Prevent path traversal: strip leading slash, collapse any ../
+        const safe = gamePath.replace(/\\/g, "/").replace(/\.\./g, "").replace(/^\/+/, "");
+        if (!safe) throw new Error("empty path after sanitise");
+        const dest = path.join(DL_DIR, safe);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.writeFileSync(dest, content || "");
+        res.writeHead(200, CORS_HEADERS); res.end("ok");
+      } catch (e) {
+        logLine("dl write failed: " + e.message);
+        res.writeHead(500, CORS_HEADERS); res.end(e.message);
+      }
+    });
+    req.on("error", () => { try { res.writeHead(400, CORS_HEADERS); res.end(); } catch (_) {} });
+    return;
+  }
+
+  // ── /sink/<name>  — append game log line to .run/game-<name>.log ───
+  if (!req.url.startsWith("/sink/")) {
     res.writeHead(404); res.end("not found"); return;
   }
   const name = req.url.slice("/sink/".length).replace(/[^a-z0-9_-]/gi, "");
@@ -288,7 +336,7 @@ const sinkServer = http.createServer((req, res) => {
   req.on("error", () => { try { res.writeHead(400); res.end(); } catch (_) {} });
 });
 sinkServer.listen(SINK_PORT, "127.0.0.1", () => {
-  logLine("sink listening on 127.0.0.1:" + SINK_PORT + " (" + Array.from(SINK_NAMES).join(", ") + ")");
+  logLine("sink listening on 127.0.0.1:" + SINK_PORT + " (/sink/<name>, /dl)");
 });
 
 // ─── status snapshot ─────────────────────────────────────────────────
