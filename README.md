@@ -236,7 +236,9 @@ Each helper pays its own NS-namespace RAM cost **only while running** (a few hun
 | `/ai/dispatch/hacknet.js`     | buy/upgrade hacknet         | ~20 GB | when AI buys/upgrades hacknet |
 | `/ai/dispatch/blade.js`       | bb_action / bb_skill        | ~8 GB  | rare — most BB work goes via `set_bladeburner_plan` |
 | `/ai/dispatch/fs.js`          | read/write/run/kill/copy/patch | ~6 GB | when AI touches files |
-| `/ai/dispatch/ui.js`          | reconnect_remote_api        | ~1.6 GB | only on `syncStale` recovery |
+| `helpers/darknet-snapshot.js` | darknet state probe         | ~4 GB  | every darknet-manager cycle |
+| `helpers/darknet-execute.js`  | heartbleed / phishing / migrate / pump-dump | ~6 GB | when manager queues heavy ops |
+| `helpers/darknet-crawler.js`  | per-node probe + auth + spread | ~2 GB | persistent on each authed darknet server |
 
 Inline (no exec round-trip, no extra RAM): `noop`, `wait`, `set_sleeve_plan`, `set_gang_plan`, `set_bladeburner_plan` (pure JSON writes the player handles itself).
 
@@ -302,6 +304,7 @@ Bitburner charges static RAM per-script based on which `ns.*` API surfaces a scr
 | `gang-manager.js`            | **31.90 GB** | `ns.gang.*` namespace is heavier than expected — ~21 unique calls    |
 | `bladeburner-manager.js`     | ~28–32 GB    | `ns.bladeburner.*` ×17 unique calls. Same shape as gang.            |
 | `sleeve-manager.js`          | ~8–32 GB     | `ns.sleeve.*` cost collapses with SF10-3                            |
+| `darknet-manager.js`         | ~4–8 GB      | Darknet autopilot — session owner, auth pass, crawler deploy         |
 | `stats.js`                   | **2.60 GB**  | Companion — small reader/UI                                          |
 | `spend-hacknet-hashes.js`    | **6.70 GB**  | Hacknet upgrade automation                                            |
 | `hack/grow/weaken.js`        | ~1.7 GB ea   | Run on worker servers, not home                     |
@@ -410,7 +413,6 @@ The AI exposes a sandboxed surface via `/ollama-actions.js` so the model can wri
 | `kill_script`             | Kill all instances of a filename on a host (intentionally open — reversible).       |
 | `copy_script`             | Copy from home (allowed dir) to a rooted server.                                    |
 | `propose_patch`           | Write a patch proposal for a PROTECTED file → `/ai/patches/pending-patch.json`.     |
-| `reconnect_remote_api`    | DOM walks Options → Remote API → Connect. Used when sync goes stale.                |
 
 **Path traversal:** `..` collapsed before allowlist check. The AI cannot escape `/ai/generated/` via `/ai/generated/../scb.js`.
 
@@ -464,6 +466,70 @@ Example `set_sleeve_plan` payload the AI might emit:
   }
 }
 ```
+
+</details>
+
+<details>
+<summary><strong>🕸️ Darknet autopilot (<code>darknet-manager.js</code>)</strong></summary>
+<br>
+
+Bitburner 3.0+ ships an `ns.dnet` namespace for the **Darknet** — a hidden network of servers behind password-gated authenticated sessions. The darknet stack runs as a standalone companion alongside the main orchestrator.
+
+**Files:**
+
+| File | Role |
+|---|---|
+| `darknet-manager.js` | Resident orchestrator — PID-owns sessions, runs the auth pass, deploys crawlers, queues heavy ops |
+| `helpers/darknet-snapshot.js` | Transient — reads `ns.dnet` state → `/Temp/darknet-snap.json` each cycle |
+| `helpers/darknet-execute.js` | Transient — applies a batch of heavy ops (heartbleed, phishing, memreal, migrate, pump-dump) |
+| `helpers/darknet-crawler.js` | Persistent per-node — self-replicating; probes + authenticates neighbours + spreads itself |
+
+**How it authenticates servers:**
+
+Darknet sessions in Bitburner are PID-bound — only the script that called `authenticate()` can reuse the session via `connectToSession()`. The manager and crawlers cooperate:
+
+1. Manager authenticates `darkweb` → owns that session → deploys a crawler onto it
+2. Crawler calls `probe()` natively from darkweb's position, authenticates neighbours, spreads to each, writes `/Temp/darknet-disc-darkweb.json` and SCPs it home
+3. `darknet-snapshot.js` merges crawler disc files + `ns.dnet.labradar()` (up to ~391 visible nodes) → marks all confirmed hosts `isDarknet: true`
+4. Manager reads the snapshot each cycle, union-merges live session probes with disc data, attempts `authenticate()` for each unclaimed neighbour while pre-connected to its parent session
+
+**Password solver** — both the manager and the crawler carry an identical hint-based solver:
+
+| Trigger | Approach |
+|---|---|
+| Model `ZeroLogon` | Fixed password `"0"` |
+| Model `Factori-Os` | All prime numbers of the required digit length (sieve) |
+| Model `Pr0verFl0` | Buffer-overflow fillers: repeated `a`/`A`/`x` + common words at exact length |
+| `passwordLength == 0` | Empty string `""` |
+| Hint contains `"divisible"` + wink `;)` or `:)` | Primes of hint length |
+| Hint contains `"divisible by N"` | Multiples of N within the correct digit range |
+| Hint contains `"value"` | Parses Roman numerals from the data field |
+| Hint contains `"base"` | Parses `"base,value"` from data field (base conversion) |
+| Hint contains `"between N and M"` | Enumerates integers strictly between N and M |
+| Hint contains `"human"` | Extracts only the digit characters from the data field |
+| Hint contains `"buffer"` | Filler strings padded to exact required length |
+| Hint contains `"dog"` | Tries `["fido", "spot", "rover", "max"]` |
+| Hint ends in a bare number, no data | Tries that number directly |
+| Unknown hint | Ollama fallback — queries the configured LAN model with hint + format + length + data; cached per host |
+
+**Directives** — write `/Temp/darknet-directives.json` to steer the manager (expires after 10 min):
+
+```json
+{
+  "ts": 1234567890000,
+  "mode": "auto",
+  "minDepth": -1,
+  "maxDepth": 999,
+  "ignoreCharisma": false,
+  "stasisPolicy": "deepest"
+}
+```
+
+`mode` values: `"auto"` (default — auth + ops), `"manual"` (no auto auth/ops), `"off"` (fully paused), `"cha_grind"` (runs phishing for charisma XP), `"explore"` (heartbleed + auth expansion priority).
+
+**Logs:** `/logs/darknet.txt` (rotates at 256 KB → `/logs/darknet.1.txt`). Auth successes and failures, crawler deploys, and cache hits all land here.
+
+**Note:** `darknet-manager.js` checks `if (!ns.dnet)` at startup and idles gracefully if the namespace isn't available — safe to leave enabled on saves that haven't reached the darknet yet.
 
 </details>
 
