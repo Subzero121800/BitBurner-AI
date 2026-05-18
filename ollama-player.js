@@ -384,10 +384,9 @@ function buildPrompt(state, safety) {
     "- When state.savings.unlocked == false, focus exclusively on income generation: deploy_hack against the highest-value targets in state.targets, commit_crime, work_company, work_faction, study, gym, hacknet purchases/upgrades, or noop/wait if RAM is full.",
     "- When state.savings.unlocked == true, spending is allowed up to safety.cashSpendCapPct of starting-cycle cash; prefer upgrades + augs that compound future income.",
     "",
-    "System health (HIGHEST PRIORITY — read this BEFORE picking actions):",
+    "System health:",
     "- state.systemHealth.syncStale: when true the host can no longer deliver fresh code into the game (the heartbeat file has gone stale). The state you're seeing may be hours old.",
-    "- When syncStale is true, your ENTIRE response must be exactly: [{\"action\":\"reconnect_remote_api\"}] — nothing else. Don't deploy, don't buy, don't propose patches. The reconnect action calls the in-game DOM to click Options→Remote API→Connect. After it succeeds, normal cycles resume.",
-    "- When syncStale is false, ignore reconnect_remote_api entirely.",
+    "- When syncStale is true, emit a noop and wait — the watchdog will restore the connection automatically. Do not attempt UI manipulation.",
     "",
     "Manager steering (autonomous companions you can override):",
     "- state.managers.{sleeve, gang, bladeburner} is each manager's per-cycle state snapshot (null if it isn't running). Use it to decide whether to override their default behaviour.",
@@ -741,7 +740,7 @@ function getSystemHealth(ns) {
     syncStale,
     heartbeatAgeSec: isFinite(heartbeatAgeMs) ? Math.round(heartbeatAgeMs / 1000) : null,
     advice: syncStale
-      ? "Remote API appears disconnected. Emit a single reconnect_remote_api action this cycle. Skip business actions until sync recovers — deploys won't survive the next code update anyway."
+      ? "Remote API appears disconnected. Emit noop and wait — the watchdog will restore the connection. Skip business actions until sync recovers."
       : "Remote API healthy. Proceed with normal action selection."
   };
 }

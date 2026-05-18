@@ -12,7 +12,7 @@ const SNAP_FILE = "/Temp/contracts-snap.json";
 /** @param {NS} ns */
 export async function main(ns) {
   ns.disableLog("ALL");
-  const servers = deepScan(ns);
+  const servers = await deepScan(ns);
   const contracts = [];
   for (const host of servers) {
     let files = [];
@@ -35,14 +35,16 @@ export async function main(ns) {
   } catch (_) {}
 }
 
-function deepScan(ns) {
+async function deepScan(ns) {
   const visited = new Set();
   const queue = ["home"];
+  let i = 0;
   while (queue.length) {
     const cur = queue.pop();
     if (visited.has(cur)) continue;
     visited.add(cur);
     for (const next of ns.scan(cur)) if (!visited.has(next)) queue.push(next);
+    if (++i % 20 === 0) await ns.sleep(0);
   }
   return [...visited];
 }

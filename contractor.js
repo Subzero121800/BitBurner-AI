@@ -161,12 +161,12 @@ function solve(type, data) {
 // ─── solvers ───────────────────────────────────────────────────────
 
 function solveLargestPrimeFactor(n) {
-  let d = 2;
-  while (n > 1) {
-    while (n % d === 0) { if (d * d > n && n > 1) { d = n; break; } n = n / d; }
-    d++;
+  let largest = 1;
+  for (let d = 2; d * d <= n; d++) {
+    while (n % d === 0) { largest = d; n = n / d; }
   }
-  return d;
+  if (n > 1) largest = n;
+  return largest;
 }
 
 function solveMaxSubarraySum(arr) {

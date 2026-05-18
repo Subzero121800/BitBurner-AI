@@ -86,7 +86,6 @@ export const ACTION_SCHEMA = [
   { action: "propose_patch",          args: ["target", "content", "reason"], desc: "Propose a change to a PROTECTED file. Writes /ai/patches/pending-patch.json — a human runs /approve-patch.js to apply" },
 
   // System health
-  { action: "reconnect_remote_api",   args: [], desc: "Best-effort programmatic Options → Remote API → Connect via DOM. Use when state.systemHealth.syncStale is true." },
 
   // Manager directives — pure /Temp/ writes, handled inline in the player.
   { action: "set_sleeve_plan",      args: ["plan"], desc: "Steer sleeve-manager. plan = { default?:{task,...}, sleeves?:{ '0':{task,...} } }. Tasks: shock_recovery|synchronize|idle|commit_crime|gym|study|company_work|faction_work|bladeburner|travel|buy_aug. Extra fields per task: crime/gym/stat/course/university/company/faction/type/city/aug/name." },
@@ -135,8 +134,6 @@ export const DISPATCH_MAP = {
   write_generated_script: "fs", delete_generated_script: "fs",
   run_script: "fs", kill_script: "fs", copy_script: "fs",
   propose_patch: "fs",
-
-  reconnect_remote_api: "ui",
 
   darknet_probe: "darknet", darknet_authenticate: "darknet",
   darknet_heartbleed: "darknet", darknet_phishing: "darknet",

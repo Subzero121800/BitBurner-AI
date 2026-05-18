@@ -116,7 +116,7 @@ const COMPANION_NEEDS_STANEK = new Set(["stanek.js", "charge.js"]);
 const AI_CONFIG = {
   // ── Connectivity ─────────────────────────────────────────────────
   backend:      "ollama",
-  ollamaHost:   "http://127.0.0.1:11434",
+  ollamaHost:   "http://192.168.0.92:11434",
   // qwen3-coder:30b is the sweet spot for a Jetson Thor / 24+ GB
   // VRAM box: code-tuned, excellent structured-JSON output, reads
   // /ollama-player.js + /ollama-actions.js coherently for

@@ -62,8 +62,6 @@ export const ACTION_SCHEMA = [
   { action: "copy_script",            args: ["script", "dst_host"],                    desc: "Copy a script from home to dst" },
   { action: "propose_patch",          args: ["target", "content", "reason"],           desc: "Propose a patch to a protected file" },
 
-  { action: "reconnect_remote_api",   args: [], desc: "Click Options -> Remote API -> Connect via DOM" },
-
   { action: "set_sleeve_plan",      args: ["plan"], desc: "Steer the sleeve manager" },
   { action: "set_gang_plan",        args: ["plan"], desc: "Steer the gang manager" },
   { action: "set_bladeburner_plan", args: ["plan"], desc: "Steer the bladeburner manager" },
@@ -104,8 +102,6 @@ export const DISPATCH_MAP = {
   write_generated_script: "fs", delete_generated_script: "fs",
   run_script: "fs", kill_script: "fs", copy_script: "fs",
   propose_patch: "fs",
-
-  reconnect_remote_api: "ui",
 
   darknet_probe: "darknet", darknet_authenticate: "darknet",
   darknet_heartbleed: "darknet", darknet_phishing: "darknet",

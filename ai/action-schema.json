@@ -49,8 +49,6 @@
     { "action": "copy_script",            "args": ["script", "dst_host"],                    "desc": "Copy a script from home to dst" },
     { "action": "propose_patch",          "args": ["target", "content", "reason"],           "desc": "Propose a patch to a protected file" },
 
-    { "action": "reconnect_remote_api",   "args": [], "desc": "Click Options Remote API Connect via DOM" },
-
     { "action": "set_sleeve_plan",      "args": ["plan"], "desc": "Steer the clone manager" },
     { "action": "set_gang_plan",        "args": ["plan"], "desc": "Steer the crew manager" },
     { "action": "set_bladeburner_plan", "args": ["plan"], "desc": "Steer the BB manager" }
@@ -79,8 +77,6 @@
     "write_generated_script": "F", "delete_generated_script": "F",
     "run_script": "F", "kill_script": "F", "copy_script": "F",
     "propose_patch": "F",
-
-    "reconnect_remote_api": "U",
 
     "noop": "I", "wait": "I",
     "set_sleeve_plan": "I", "set_gang_plan": "I", "set_bladeburner_plan": "I"

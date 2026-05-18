@@ -1,6 +1,6 @@
 /**
  * /helpers/darknet-snapshot.js — read-only Darknet (ns.dnet) probe
- * DARKNET_SNAPSHOT_VERSION_5
+ * DARKNET_SNAPSHOT_VERSION_7
  *
  * v4 changes:
  *   - Remove broken ns.singularity.connect navigation (confirmed no-op for darknet servers)
@@ -65,16 +65,32 @@ export async function main(ns) {
     for (const h of baseProbe) pushHost(h);
   }
 
-  // 2) Merge crawler discovery reports (written by /helpers/darknet-crawler.js
-  //    running on each authenticated server, scp'd back to home).
-  //    These give us neighbours that probe() from home can never see.
-  for (const f of ns.ls("home", "/Temp/darknet-disc-")) {
+  // 2a) Merge manager expansion probes (written by darknet-manager each tick).
+  //     The manager calls connectToSession+probe() from its PID (session owner),
+  //     which is the only way to see neighbours of authenticated servers.
+  try {
+    const exp = ns.fileExists("/Temp/darknet-expansion.json", "home")
+      ? JSON.parse(ns.read("/Temp/darknet-expansion.json"))
+      : null;
+    if (exp && Array.isArray(exp.expansion)) {
+      for (const e of exp.expansion) {
+        if (!e.source || !Array.isArray(e.neighbours)) continue;
+        out.expansion.push({ source: e.source, neighbours: e.neighbours.slice() });
+        for (const h of e.neighbours) pushHost(h);
+      }
+    }
+  } catch (_) {}
+
+  // 2b) Merge crawler discovery reports (written by /helpers/darknet-crawler.js
+  //     running on each authenticated server, scp'd back to home).
+  for (const f of ns.ls("home").filter(f => f.startsWith("/Temp/darknet-disc-"))) {
     try {
       const disc = JSON.parse(ns.read(f));
       if (!disc || !disc.host) continue;
       const src = disc.host;
       const neighbours = Array.isArray(disc.neighbors) ? disc.neighbors : [];
       out.expansion.push({ source: src, neighbours: neighbours.slice() });
+      pushHost(src);
       for (const h of neighbours) pushHost(h);
     } catch (_) {}
   }
@@ -99,6 +115,22 @@ export async function main(ns) {
   // 4) Stasis-linked servers (always include even if not adjacent).
   for (const host of out.stasis.links) pushHost(host);
 
+  // Post-process: mark hosts as isDarknet=true when discovered via probe()-based
+  // expansion OR via labradar(). isDarknetServer() returns false for non-adjacent
+  // nodes even when they are genuine darknet servers, so trust discovery source.
+  const darknetConfirmed = new Set();
+  for (const e of out.expansion) {
+    if (e.source && e.source !== "(current)") darknetConfirmed.add(e.source);
+    for (const h of e.neighbours) darknetConfirmed.add(h);
+  }
+  // labradar() is a darknet-specific API — everything it returns is a darknet node.
+  for (const h of out.labradar) {
+    darknetConfirmed.add(typeof h === "string" ? h : (h.host || String(h)));
+  }
+  for (const s of out.servers) {
+    if (darknetConfirmed.has(s.host)) s.isDarknet = true;
+  }
+
   write(ns, out);
 }
 
@@ -117,7 +149,7 @@ function write(ns, payload) {
   try {
     ns.write(SNAP_FILE, JSON.stringify({
       ts: Date.now(),
-      version: "DARKNET_SNAPSHOT_VERSION_5",
+      version: "DARKNET_SNAPSHOT_VERSION_7",
       ...payload
     }, null, 2), "w");
   } catch (_) {}
